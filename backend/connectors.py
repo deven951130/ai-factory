@@ -109,10 +109,12 @@ class OllamaConnector(Connector):
     def available(self):
         try:
             r = httpx.get(f"{self.base}/api/tags", timeout=1.5)
-            names = {m["name"] for m in r.json().get("models", [])}
-            if self.model and self.model not in names:
-                return (False, f"Ollama 已啟動但缺少模型 {self.model}")
-            return (True, self.base)
+            names = [m["name"] for m in r.json().get("models", [])]
+            if not names:
+                return (False, "Ollama 已啟動但沒有任何模型（ollama pull <model>）")
+            if self.model not in names:  # 設定的模型沒裝 → 退而用已安裝的第一個
+                self.model = names[0]
+            return (True, f"{self.base} · {self.model}")
         except Exception:
             return (False, "Ollama 未啟動")
 
