@@ -1,0 +1,13 @@
+{
+  "nodes": [
+    {"id": "gemini", "label": "Gemini", "kind": "gemini", "role": "分析 / 長文研究"},
+    {"id": "claude-opus", "label": "Claude Opus", "kind": "claude", "model": "opus", "role": "架構 / 審查"},
+    {"id": "claude-sonnet", "label": "Claude Sonnet", "kind": "claude", "model": "sonnet", "role": "實作"},
+    {"id": "ollama", "label": "本地 Qwen", "kind": "ollama", "model": "qwen2.5-coder:7b", "role": "格式轉換 / 草稿"}
+  ],
+  "pipeline": [
+    {"name": "分析", "node": "gemini", "template": "你是分析師。請把下列需求拆成明確的步驟與驗收條件：\n\n{input}"},
+    {"name": "實作", "node": "claude-sonnet", "template": "依下列分析結果產出實作方案：\n\n{input}"},
+    {"name": "審查", "node": "claude-opus", "template": "審查下列方案，列出風險與必要修正：\n\n{input}"}
+  ]
+}

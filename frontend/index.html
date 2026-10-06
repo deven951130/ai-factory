@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 工廠</title>
+<style>
+  :root { --bg:#0f1218; --panel:#171c26; --line:#2a3242; --text:#e6eaf2; --mute:#8b95a8;
+          --idle:#5b6578; --run:#3b82f6; --done:#22c55e; --fail:#ef4444; --wait:#f59e0b; --off:#3a3f4b; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,"Noto Sans TC",sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:12px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; } #conn { font-size:12px; color:var(--mute); }
+  main { display:grid; grid-template-columns:1fr 380px; gap:16px; padding:16px 20px; }
+  @media (max-width:900px){ main{grid-template-columns:1fr;} }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  h2 { font-size:13px; margin:0 0 10px; color:var(--mute); font-weight:600; letter-spacing:.04em; }
+  .col { display:flex; flex-direction:column; gap:16px; }
+  #factory { display:flex; flex-wrap:wrap; gap:12px; }
+  .node { flex:1 1 150px; min-width:150px; border:2px solid var(--idle); border-radius:10px; padding:10px 12px; background:#10141c; transition:.2s; }
+  .node .name { font-weight:600; } .node .role { color:var(--mute); font-size:12px; }
+  .node .st { margin-top:6px; font-size:12px; display:flex; align-items:center; gap:6px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--idle); }
+  .node.running { border-color:var(--run); box-shadow:0 0 14px #3b82f655; } .node.running .dot { background:var(--run); animation:p 1s infinite; }
+  .node.waiting { border-color:var(--wait); box-shadow:0 0 14px #f59e0b55; } .node.waiting .dot { background:var(--wait); animation:p 1s infinite; }
+  .node.failed { border-color:var(--fail); } .node.failed .dot { background:var(--fail); }
+  .node.offline { border-color:var(--off); opacity:.55; } .node.offline .dot { background:var(--off); }
+  @keyframes p { 50% { opacity:.3; } }
+  .belt { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+  .stage { padding:6px 12px; border-radius:20px; border:1px solid var(--line); font-size:12px; color:var(--mute); }
+  .stage.current { border-color:var(--run); color:var(--text); background:#3b82f622; }
+  .stage.past { border-color:var(--done); color:var(--done); }
+  .arrow { color:var(--mute); }
+  .task { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:8px; }
+  .badge { font-size:11px; padding:1px 8px; border-radius:10px; background:var(--line); }
+  .badge.running{background:var(--run)} .badge.done{background:var(--done);color:#000} .badge.blocked{background:var(--fail)} .badge.waiting_user{background:var(--wait);color:#000}
+  .ask { border:2px solid var(--wait); background:#f59e0b14; border-radius:10px; padding:10px; margin-bottom:10px; }
+  input,textarea,select,button { font:inherit; color:var(--text); background:#0f1218; border:1px solid var(--line); border-radius:6px; padding:7px 9px; }
+  button { background:var(--run); border-color:var(--run); cursor:pointer; } button:disabled{opacity:.5}
+  textarea { width:100%; resize:vertical; }
+  .row { display:flex; gap:8px; margin-top:8px; } .row > input { flex:1; }
+  #log, #chat { height:240px; overflow:auto; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; }
+  .err { color:var(--fail); } .me { color:var(--run); } .ai { color:var(--text); } .src { color:var(--mute); }
+  .out { margin-top:6px; font-size:12px; color:var(--mute); white-space:pre-wrap; max-height:140px; overflow:auto; }
+</style>
+</head>
+<body>
+<header><h1>🏭 AI 工廠</h1><span id="conn">連線中…</span></header>
+<main>
+  <div class="col">
+    <section><h2>工廠現況</h2><div id="factory"></div></section>
+    <section><h2>生產線</h2><div id="belt" class="belt"></div></section>
+    <section><h2>任務</h2>
+      <div id="asks"></div>
+      <input id="title" placeholder="任務標題" style="width:100%;margin-bottom:6px">
+      <textarea id="prompt" rows="3" placeholder="描述需求，送進生產線（分析 → 實作 → 審查）"></textarea>
+      <div class="row"><button id="go">送進工廠</button></div>
+      <div id="tasks" style="margin-top:12px"></div>
+    </section>
+  </div>
+  <div class="col">
+    <section><h2>隨時發問</h2>
+      <div id="chat"></div>
+      <div class="row"><select id="target"></select></div>
+      <div class="row"><input id="msg" placeholder="問任何一個 AI…"><button id="send">送出</button></div>
+    </section>
+    <section><h2>即時日誌</h2><div id="log"></div></section>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const S = { nodes:{}, tasks:{}, pipeline:[] };
+let liveBubble = null;
+
+function esc(t){ return t.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+const STATUS = { idle:'閒置', running:'執行中', waiting:'等你回答', failed:'失敗', offline:'離線' };
+
+function render() {
+  $('#factory').innerHTML = Object.values(S.nodes).map(n =>
+    `<div class="node ${n.status}"><div class="name">${esc(n.label)}</div><div class="role">${esc(n.role)}</div>
+     <div class="st"><span class="dot"></span>${STATUS[n.status]||n.status}</div>
+     <div class="role">${esc(n.detail||'')}</div></div>`).join('');
+  const active = Object.values(S.tasks).find(t => ['running','waiting_user'].includes(t.status));
+  $('#belt').innerHTML = S.pipeline.map((s,i) => {
+    const cls = active ? (i < active.stage_index ? 'past' : i === active.stage_index ? 'current' : '') : '';
+    return `<span class="stage ${cls}">${esc(s.name)} · ${esc(S.nodes[s.node]?.label||s.node)}</span>`;
+  }).join('<span class="arrow">→</span>');
+  const tasks = Object.values(S.tasks).reverse();
+  $('#tasks').innerHTML = tasks.map(t => `<div class="task"><b>${esc(t.title)}</b>
+     <span class="badge ${t.status}">${t.status}</span> ${t.stage ? '· '+esc(t.stage) : ''}
+     ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+     ${t.outputs.map(o => `<div class="out"><b>${esc(o.stage)}</b>\n${esc(o.text)}</div>`).join('')}</div>`).join('');
+  $('#asks').innerHTML = tasks.filter(t => t.question).map(t => `<div class="ask">
+     <b>${esc(S.nodes[t.question.node]?.label||t.question.node)} 需要你回答：</b><div>${esc(t.question.text)}</div>
+     <div class="row"><input id="a-${t.id}" placeholder="你的回答"><button data-answer="${t.id}">回覆</button></div></div>`).join('');
+}
+function log(text, cls='') { const l = $('#log'); l.insertAdjacentHTML('beforeend', `<div class="${cls}">${esc(text)}</div>`); l.scrollTop = l.scrollHeight; }
+function chatLine(who, cls, text) { const c = $('#chat'); c.insertAdjacentHTML('beforeend', `<div class="${cls}"><span class="src">${esc(who)}：</span>${esc(text)}</div>`); c.scrollTop = c.scrollHeight; }
+
+function onEvent(ev) {
+  if (ev.type === 'snapshot') { S.nodes = Object.fromEntries(ev.nodes.map(n=>[n.id,n])); S.tasks = Object.fromEntries(ev.tasks.map(t=>[t.id,t])); S.pipeline = ev.pipeline;
+    $('#target').innerHTML = ev.nodes.map(n=>`<option value="${n.id}">${esc(n.label)}</option>`).join(''); }
+  else if (ev.type === 'node') S.nodes[ev.node.id] = ev.node;
+  else if (ev.type === 'task') S.tasks[ev.task.id] = ev.task;
+  else if (ev.type === 'log') log(ev.text, ev.level === 'error' ? 'err' : '');
+  else if (ev.type === 'ask') { log(`❓ ${ev.node} 提問：${ev.text}`, 'err'); document.title = '❓ AI 需要你回答'; try { new Notification('AI 需要你回答', {body: ev.text}); } catch {} }
+  else if (ev.type === 'chunk' && !ev.task_id) { if (!liveBubble) { $('#chat').insertAdjacentHTML('beforeend', `<div class="ai"><span class="src">${esc(ev.node)}：</span><span id="live"></span></div>`); liveBubble = $('#live'); } liveBubble.textContent += ev.text; $('#chat').scrollTop = 1e9; }
+  else if (ev.type === 'chat') { if (ev.role === 'user') chatLine('你', 'me', ev.text); else { if (liveBubble) { liveBubble.removeAttribute('id'); liveBubble = null; } else chatLine(ev.node, 'ai', ev.text); } }
+  if (ev.type === 'task' && !ev.task.question) document.title = 'AI 工廠';
+  if (ev.type === 'chunk') return;
+  render();
+}
+
+let backoff = 500;
+function connect() {
+  const ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://') + location.host + '/ws');
+  ws.onopen = () => { $('#conn').textContent = '● 已連線'; backoff = 500; };
+  ws.onmessage = m => onEvent(JSON.parse(m.data));
+  ws.onclose = () => { $('#conn').textContent = '○ 斷線，重連中…'; setTimeout(connect, backoff); backoff = Math.min(backoff*2, 8000); };
+}
+connect();
+try { Notification.requestPermission(); } catch {}
+
+async function post(url, body) { const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); if(!r.ok) log((await r.json()).detail || r.statusText, 'err'); }
+$('#go').onclick = () => { const p = $('#prompt').value.trim(); if (!p) return; post('/api/tasks', {title: $('#title').value.trim() || p.slice(0,20), prompt: p}); $('#prompt').value=''; };
+const send = () => { const m = $('#msg').value.trim(); if (!m) return; post('/api/chat', {node: $('#target').value, message: m}); $('#msg').value=''; };
+$('#send').onclick = send; $('#msg').onkeydown = e => { if (e.key === 'Enter') send(); };
+document.addEventListener('click', e => { const id = e.target.dataset?.answer; if (!id) return; const el = $('#a-'+id); if (el.value.trim()) post(`/api/tasks/${id}/answer`, {text: el.value.trim()}); });
+</script>
+</body>
+</html>
