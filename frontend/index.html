@@ -40,7 +40,7 @@
   textarea { width:100%; resize:vertical; }
   .row { display:flex; gap:8px; margin-top:8px; } .row > input { flex:1; }
   #log, #chat { height:240px; overflow:auto; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; }
-  .err { color:var(--fail); } .me { color:var(--run); } .ai { color:var(--text); } .src { color:var(--mute); }
+  .me { color:var(--run); } .ai { color:var(--text); } .err { color:var(--fail); } .src { color:var(--mute); }
   .out.live { color:var(--text); border-left:2px solid var(--run); padding-left:8px; }
   button.ghost { background:transparent; border-color:var(--line); font-size:12px; padding:2px 8px; }
   .badge.cancelled{background:var(--off)}
@@ -117,8 +117,9 @@ function renderAsks(pending) {
     div.innerHTML = `<b>${esc(label(t.question.node))} 需要你回答（${esc(t.title)}）：</b><div>${esc(t.question.text)}</div>
       <div class="row"><input placeholder="你的回答"><button>回覆</button></div>`;
     const input = div.querySelector('input');
-    const submit = async () => { const v = input.value.trim(); if (v && await post(`/api/tasks/${t.id}/answer`, {text: v})) input.value = ''; };
-    div.querySelector('button').onclick = submit;
+    const btn = div.querySelector('button');
+    const submit = () => once(btn, async () => { const v = input.value.trim(); if (v && await post(`/api/tasks/${t.id}/answer`, {text: v})) input.value = ''; });
+    btn.onclick = submit;
     input.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) submit(); };
     box.appendChild(div);
   }
@@ -133,6 +134,7 @@ function onEvent(ev) {
   switch (ev.type) {
     case 'snapshot': {
       closeBubbles('（連線中斷）');
+      taskLive.clear();
       S.nodes = Object.fromEntries(ev.nodes.map(n=>[n.id,n])); S.tasks = Object.fromEntries(ev.tasks.map(t=>[t.id,t])); S.pipeline = ev.pipeline;
       const prev = $('#target').value;
       $('#target').innerHTML = ev.nodes.map(n=>`<option value="${esc(n.id)}">${esc(n.label)}</option>`).join('');
@@ -147,8 +149,12 @@ function onEvent(ev) {
     }
     case 'log': log(ev.text, ev.level === 'error' ? 'err' : ''); break;
     case 'ask': log(`❓ ${label(ev.node)} 提問：${ev.text}`, 'err'); try { new Notification('AI 需要你回答', {body: ev.text}); } catch {} break;
-    case 'attempt':  // 重試時丟掉上一次失敗的半截輸出
-      if (ev.attempt > 1) { if (ev.task_id) taskLive.delete(ev.task_id); else if (bubbles.has(ev.node)) bubbleFor(ev.node).textContent = ''; }
+    case 'attempt':  // 新的一次呼叫：丟掉上一次（失敗或提問前）的半截輸出
+      if (ev.task_id) {
+        taskLive.delete(ev.task_id);
+        const el = document.getElementById('tl-' + ev.task_id);
+        if (el) el.textContent = '';
+      } else if (ev.attempt > 1 && bubbles.has(ev.node)) bubbleFor(ev.node).textContent = '';
       return;
     case 'chunk':
       if (ev.task_id) {
@@ -188,11 +194,20 @@ async function post(url, body) {
   } catch (e) { log(`無法連到伺服器：${e.message}`, 'err'); }
   return false;
 }
-$('#go').onclick = async () => {
+// 送出期間鎖住按鈕，避免連點或連按 Enter 重複送出；失敗時保留輸入內容。
+async function once(btn, fn) {
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try { await fn(); } finally { btn.disabled = false; }
+}
+$('#go').onclick = () => once($('#go'), async () => {
   const p = $('#prompt').value.trim(); if (!p) return;
   if (await post('/api/tasks', {title: $('#title').value.trim(), prompt: p})) { $('#prompt').value = ''; $('#title').value = ''; }
-};
-const send = async () => { const m = $('#msg').value.trim(); if (m && await post('/api/chat', {node: $('#target').value, message: m})) $('#msg').value = ''; };
+});
+const send = () => once($('#send'), async () => {
+  const m = $('#msg').value.trim();
+  if (m && await post('/api/chat', {node: $('#target').value, message: m})) $('#msg').value = '';
+});
 $('#send').onclick = send; $('#msg').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) send(); };
 document.addEventListener('click', e => { const id = e.target.dataset?.cancel; if (id) post(`/api/tasks/${id}/cancel`); });
 </script>

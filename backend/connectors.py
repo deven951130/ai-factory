@@ -20,7 +20,8 @@ import httpx
 
 OnChunk = Callable[[str], Awaitable[None]]
 
-# 純文字生成情境不需要這些工具；關掉避免 AI 自行讀寫檔案、執行指令或上網。
+# 純文字生成情境不需要工具：主要靠 `--tools ""` 全部關掉；這份清單是保險，
+# 萬一某版本把空字串解讀成「預設工具」時仍擋住危險工具。
 # PowerShell：Windows 沒裝 Git Bash 時 Claude Code 會改開這個工具。
 CLAUDE_DISALLOWED = (
     "Bash PowerShell Edit Write Read Glob Grep NotebookEdit WebFetch WebSearch Task TodoWrite"
@@ -78,6 +79,12 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
     Windows：.cmd 由 cmd.exe 執行，proc 只是 cmd.exe，真正的 node.exe 是孫程序；
     POSIX：gemini 會再 relaunch 一個子 node。只殺 proc 會留下持續消耗額度的孤兒。
     """
+    if sys.platform != "win32":
+        # 不看 returncode：直接子程序可能已結束，但孫程序仍在同一個 process group 裡。
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     if proc.returncode is None:
         if sys.platform == "win32":
             try:
@@ -87,11 +94,6 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
                 )
                 await asyncio.wait_for(k.wait(), 10)
             except Exception:
-                pass
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
                 pass
         try:
             proc.kill()
@@ -198,10 +200,14 @@ class ClaudeConnector(Connector):
             exe, "-p", "--model", self.model or "sonnet",
             "--output-format", "stream-json", "--verbose", "--include-partial-messages",
             "--strict-mcp-config",
+            # 不給任何工具：有工具時模型可能「寫答案 → 呼叫工具 → 再寫一段」，
+            # 而 result 只保留最後一輪，前面的內容會遺失。
+            "--tools", "",
             "--disallowed-tools", *CLAUDE_DISALLOWED.split(),
         ]
         buf = ""
         streamed: list[str] = []
+        turns: list[str] = []  # 每一輪 assistant 訊息的完整文字
         result: dict | None = None
 
         async def on_text(text: str) -> None:
@@ -221,6 +227,11 @@ class ClaudeConnector(Connector):
                     if delta.get("type") == "text_delta" and delta.get("text"):
                         streamed.append(delta["text"])
                         await on_chunk(delta["text"])
+                elif ev.get("type") == "assistant":
+                    blocks = ev.get("message", {}).get("content") or []
+                    text = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                    if text.strip():
+                        turns.append(text.strip())
                 elif ev.get("type") == "result":
                     result = ev
 
@@ -232,6 +243,8 @@ class ClaudeConnector(Connector):
             if result.get("is_error"):
                 # claude 內部已重試過（例如 429）；這類錯誤再重試多半也一樣。
                 raise ConnectorError(text[-300:] or _fail_detail(code, out, err), retryable=False)
+            if len(turns) > 1:  # 保險：多輪時 result 只有最後一輪，改用全部輪次
+                return "\n\n".join(turns)
             return text.strip() or "".join(streamed).strip()
         if code != 0:
             raise ConnectorError(_fail_detail(code, out, err))

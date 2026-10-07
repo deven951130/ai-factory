@@ -217,6 +217,23 @@ def test_cancel_running_task(tmp_path):
     assert f.nodes["gemini"]["status"] == "idle"
 
 
+def test_cancel_during_retry_backoff_settles_node(tmp_path):
+    async def go():
+        f = make(tmp_path)
+
+        async def flaky(prompt, on_chunk):
+            raise ConnectorError("exit 1")
+        f.connectors["gemini"].run = flaky
+        t = f.start_task("t", "x")
+        await wait_for(lambda: f.nodes["gemini"]["detail"].endswith("嘗試 1"))
+        await asyncio.sleep(0.05)  # 落在第一次失敗後的重試等待裡
+        f.cancel(t["id"])
+        await wait_for(lambda: t["status"] == "cancelled")
+        return f
+    f = asyncio.run(go())
+    assert f.nodes["gemini"]["status"] == "idle" and f.nodes["gemini"]["task_id"] is None
+
+
 def test_cancel_waiting_task(tmp_path):
     async def go():
         f = make(tmp_path)
@@ -241,11 +258,36 @@ def test_nodes_json_with_bom(tmp_path):
 
 # ---------------- API / WebSocket ----------------
 
+LOCAL = "http://127.0.0.1:8000"
+WS_HOST = {"Host": "127.0.0.1:8000"}  # TestClient 的 WebSocket 不用 base_url，Host 固定是 testserver
+
+
+def test_rejects_foreign_origin_and_host(tmp_path):
+    from starlette.websockets import WebSocketDisconnect
+    app = create_app(force_fake=True, data_dir=tmp_path)
+    with TestClient(app, base_url=LOCAL) as c:
+        assert c.get("/api/state").status_code == 200
+        assert c.post("/api/tasks", json={"title": "", "prompt": "x"},
+                      headers={"Origin": "http://127.0.0.1:8000"}).status_code == 200
+        # 其他網站的頁面發出的 POST
+        assert c.post("/api/tasks/x/cancel", headers={"Origin": "https://evil.example"}).status_code == 403
+        # DNS rebinding：Host 是外部網域
+        assert c.get("/api/state", headers={"Host": "evil.example:8000"}).status_code == 403
+        # 其他網站的頁面開 WebSocket
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("/ws", headers={**WS_HOST, "Origin": "https://evil.example"}) as ws:
+                ws.receive_json()
+        with pytest.raises(WebSocketDisconnect):
+            with c.websocket_connect("/ws", headers={**WS_HOST, "Origin": "null"}) as ws:
+                ws.receive_json()
+        with c.websocket_connect("/ws", headers={**WS_HOST, "Origin": "http://localhost:8000"}) as ws:
+            assert ws.receive_json()["type"] == "snapshot"
+
 def test_api_chat_and_state(tmp_path):
     app = create_app(force_fake=True, data_dir=tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         assert len(c.get("/api/state").json()["nodes"]) == 4
-        with c.websocket_connect("/ws") as ws:
+        with c.websocket_connect("/ws", headers=WS_HOST) as ws:
             assert ws.receive_json()["type"] == "snapshot"
             assert c.post("/api/chat", json={"node": "ollama", "message": "hi"}).status_code == 200
             seen = set()
@@ -261,16 +303,16 @@ def test_api_chat_and_state(tmp_path):
 def test_lone_surrogate_title_does_not_break_dashboard(tmp_path):
     app = create_app(force_fake=True, data_dir=tmp_path)
     body = '{"title": "abc\\ud83d", "prompt": "\\ud83c x"}'  # 前端把 emoji 切一半的樣子
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         r = c.post("/api/tasks", content=body, headers={"Content-Type": "application/json"})
         assert r.status_code == 200
-        with c.websocket_connect("/ws") as ws:
+        with c.websocket_connect("/ws", headers=WS_HOST) as ws:
             assert ws.receive_json()["type"] == "snapshot"
 
 
 def test_offline_node_rechecked_on_chat(tmp_path):
     app = create_app(force_fake=True, data_dir=tmp_path)
-    with TestClient(app) as c:
+    with TestClient(app, base_url=LOCAL) as c:
         f = app.state.factory
         f.nodes["ollama"]["status"] = "offline"  # 假裝啟動時 Ollama 還沒起來
         assert c.post("/api/chat", json={"node": "ollama", "message": "hi"}).status_code == 200
@@ -330,6 +372,24 @@ def test_claude_stream_json_parsing(tmp_path, monkeypatch):
     c = ClaudeConnector(id="c", label="C", kind="claude", model="sonnet", workdir=tmp_path)
     assert asyncio.run(c.run("hi", on_chunk)) == "藍色"
     assert chunks == ["藍", "色"]
+
+
+@posix_only
+def test_claude_multi_turn_keeps_every_turn(tmp_path, monkeypatch):
+    lines = [
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "ALPHA"}, {"type": "tool_use", "name": "TaskList"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "OMEGA"}]}},
+        {"type": "result", "is_error": False, "num_turns": 2, "result": "OMEGA"},
+    ]
+    payload = "".join(json.dumps(x) + "\n" for x in lines)
+    d = fake_cli(tmp_path, "claude", (
+        "import sys\n"
+        "assert sys.argv[sys.argv.index('--tools') + 1] == ''\n"
+        f"sys.stdin.read()\nsys.stdout.write({payload!r})\n"
+    ))
+    monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ['PATH']}")
+    c = ClaudeConnector(id="c", label="C", kind="claude", workdir=tmp_path)
+    assert asyncio.run(c.run("hi", nothing)) == "ALPHA\n\nOMEGA"
 
 
 @posix_only

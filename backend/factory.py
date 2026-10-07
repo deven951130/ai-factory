@@ -88,6 +88,9 @@ class Factory:
                 n["status"], n["detail"] = "offline", detail
             elif n["status"] in ("offline", "idle"):
                 n["status"], n["detail"] = "idle", detail
+                waiting = self._waiting_task_for(nid)
+                if waiting:  # 恢復上線時，若有任務在等這個節點的問題，維持「等你回答」
+                    n.update(status="waiting", detail="等待你的回答", task_id=waiting)
             if (n["status"], n["detail"]) != before:
                 await self.emit({"type": "node", "node": dict(n)})
 
@@ -114,31 +117,37 @@ class Factory:
     async def call(self, nid: str, prompt: str, task_id: str | None = None, stage: str = "") -> str:
         conn = self.connectors[nid]
         async with self._lock[nid]:  # 同一節點一次只跑一件，避免撞額度
-            last_err = ""
-            for attempt in range(MAX_RETRY + 1):
-                await self._set(nid, "running", f"{stage} 嘗試 {attempt + 1}", task_id)
-                await self.emit({"type": "attempt", "node": nid, "task_id": task_id, "attempt": attempt + 1})
+            # 取消可能發生在任何 await（執行中、重試等待、寫事件），一律在這裡結算節點狀態。
+            # 放在鎖裡面：還在等鎖時被取消，不能去改別人正在用的節點。
+            try:
+                return await self._attempts(nid, conn, prompt, task_id, stage)
+            except asyncio.CancelledError:
+                await self._settle(nid, "已取消")
+                raise
 
-                async def chunk(text: str) -> None:
-                    await self.emit({"type": "chunk", "node": nid, "task_id": task_id, "text": text})
+    async def _attempts(self, nid: str, conn: Connector, prompt: str, task_id: str | None, stage: str) -> str:
+        last_err = ""
+        for attempt in range(MAX_RETRY + 1):
+            await self._set(nid, "running", f"{stage} 嘗試 {attempt + 1}", task_id)
+            await self.emit({"type": "attempt", "node": nid, "task_id": task_id, "attempt": attempt + 1})
 
-                try:
-                    out = await conn.run(prompt, chunk)
-                    await self._settle(nid, "完成")
-                    return out
-                except asyncio.CancelledError:
-                    await self._settle(nid, "已取消")
-                    raise
-                except Exception as e:  # 非預期錯誤也要轉成節點失敗，不能讓任務卡在 running
-                    last_err = str(e) if isinstance(e, ConnectorError) else f"{type(e).__name__}: {e}"
-                    retryable = getattr(e, "retryable", True)
-                    await self.emit({"type": "log", "level": "error", "node": nid, "task_id": task_id,
-                                     "text": f"{nid} 失敗（{attempt + 1}/{MAX_RETRY + 1}）：{last_err}"})
-                    if not retryable:
-                        break
-                    await asyncio.sleep(0.2 * (attempt + 1))
-            await self._set(nid, "failed", last_err, task_id)
-            raise ConnectorError(last_err, retryable=False)
+            async def chunk(text: str) -> None:
+                await self.emit({"type": "chunk", "node": nid, "task_id": task_id, "text": text})
+
+            try:
+                out = await conn.run(prompt, chunk)
+                await self._settle(nid, "完成")
+                return out
+            except Exception as e:  # 非預期錯誤也要轉成節點失敗，不能讓任務卡在 running
+                last_err = str(e) if isinstance(e, ConnectorError) else f"{type(e).__name__}: {e}"
+                retryable = getattr(e, "retryable", True)
+            await self.emit({"type": "log", "level": "error", "node": nid, "task_id": task_id,
+                             "text": f"{nid} 失敗（{attempt + 1}/{MAX_RETRY + 1}）：{last_err}"})
+            if not retryable or attempt == MAX_RETRY:
+                break
+            await asyncio.sleep(0.2 * (attempt + 1))
+        await self._set(nid, "failed", last_err, task_id)
+        raise ConnectorError(last_err, retryable=False)
 
     # ---------- 使用者對話 ----------
     async def chat(self, nid: str, message: str) -> str:

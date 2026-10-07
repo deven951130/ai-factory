@@ -6,6 +6,7 @@ import contextlib
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
@@ -17,6 +18,45 @@ from .factory import Factory
 ROOT = Path(__file__).resolve().parent.parent
 REFRESH_EVERY = 15  # 秒；Ollama 可能在 Dashboard 啟動之後才起來
 WS_QUEUE_MAX = 5000
+DEFAULT_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _hostname(value: str) -> str | None:
+    try:
+        return urlsplit(value if "//" in value else "//" + value).hostname
+    except ValueError:
+        return None
+
+
+class LocalOnly:
+    """只接受本機來源的請求。
+
+    - Host 必須是本機名稱：擋 DNS rebinding（惡意網域解析到 127.0.0.1 後以同源身分讀資料）。
+    - 有 Origin 時（瀏覽器的 POST 與 WebSocket 一定會帶），來源也必須是本機：
+      瀏覽器不對 WebSocket 套用 CORS，不檢查的話任何網頁都能連 /ws 讀走所有 prompt 與輸出。
+    """
+
+    def __init__(self, app, allowed: set[str]):
+        self.app, self.allowed = app, allowed
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            ok = _hostname(headers.get("host", "")) in self.allowed
+            origin = headers.get("origin")
+            checks_origin = scope["type"] == "websocket" or scope.get("method") not in ("GET", "HEAD")
+            if ok and origin is not None and checks_origin:
+                ok = _hostname(origin) in self.allowed
+            if not ok:
+                if scope["type"] == "websocket":
+                    await receive()  # websocket.connect
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await send({"type": "http.response.start", "status": 403,
+                                "headers": [(b"content-type", b"text/plain; charset=utf-8")]})
+                    await send({"type": "http.response.body", "body": "只接受本機存取".encode()})
+                return
+        await self.app(scope, receive, send)
 
 
 class _In(BaseModel):
@@ -41,9 +81,14 @@ class AnswerIn(_In):
     text: str
 
 
-def create_app(force_fake: bool | None = None, data_dir: Path | None = None) -> FastAPI:
+def create_app(
+    force_fake: bool | None = None, data_dir: Path | None = None, allowed_hosts: set[str] | None = None
+) -> FastAPI:
     if force_fake is None:
         force_fake = os.environ.get("FACTORY_FAKE") == "1"
+    if allowed_hosts is None:  # 例如要從區網其他電腦開：FACTORY_ALLOWED_HOSTS=192.168.1.10
+        extra = os.environ.get("FACTORY_ALLOWED_HOSTS", "")
+        allowed_hosts = set(DEFAULT_HOSTS) | {h.strip() for h in extra.split(",") if h.strip()}
     factory = Factory(ROOT / "nodes.json", data_dir or ROOT / "data", force_fake)
 
     async def refresher() -> None:
@@ -61,6 +106,7 @@ def create_app(force_fake: bool | None = None, data_dir: Path | None = None) -> 
         await factory.shutdown()
 
     app = FastAPI(title="AI Factory", lifespan=lifespan)
+    app.add_middleware(LocalOnly, allowed=allowed_hosts)
     app.state.factory = factory
     background: set[asyncio.Task] = set()
 
@@ -124,9 +170,11 @@ def create_app(force_fake: bool | None = None, data_dir: Path | None = None) -> 
             while (await sock.receive())["type"] != "websocket.disconnect":
                 pass
 
-        factory.subscribers.add(sub)
         try:
             await factory.refresh()
+            # 訂閱與取快照之間不能有 await：否則快照之前的事件會在快照之後重播，
+            # 前端會把上一階段的串流接到新階段後面。
+            factory.subscribers.add(sub)
             await sock.send_json({"type": "snapshot", **factory.snapshot()})
             jobs = [asyncio.create_task(c) for c in (sender(), receiver(), overflow.wait())]
             done, pending = await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
