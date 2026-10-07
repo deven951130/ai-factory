@@ -237,7 +237,7 @@ class ClaudeConnector(Connector):
         cfg = self._config_dir()
         if cfg and not os.path.isdir(cfg):
             return (False, f"找不到 config_dir：{cfg}")
-        return (True, exe)
+        return (True, "")  # 卡片上改顯示帳號，不顯示執行檔路徑
 
     def _env(self) -> dict:
         return claude_env(self._config_dir(), bool(self.extra.get("use_api_key")))
@@ -304,7 +304,7 @@ class ClaudeConnector(Connector):
 class GeminiConnector(Connector):
     def available(self):
         exe = _which("gemini")
-        return (bool(exe), exe or "未安裝 gemini CLI（npm install -g @google/gemini-cli）")
+        return (True, "") if exe else (False, "未安裝 gemini CLI（npm install -g @google/gemini-cli）")
 
     def _env(self) -> dict:
         env = dict(os.environ)
@@ -338,7 +338,7 @@ class CodexConnector(Connector):
 
     def available(self):
         exe = _which("codex")
-        return (bool(exe), exe or "未安裝 codex CLI（npm install -g @openai/codex）")
+        return (True, "") if exe else (False, "未安裝 codex CLI（npm install -g @openai/codex）")
 
     async def run(self, prompt, on_chunk):
         exe = _which("codex") or "codex"

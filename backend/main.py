@@ -91,6 +91,7 @@ class ChatIn(_In):
 class TaskIn(_In):
     title: str
     prompt: str
+    pipeline: str | None = None  # 哪一條生產線；沒給就用第一條
 
 
 class AnswerIn(_In):
@@ -138,6 +139,7 @@ class StageIn(_In):
 
 
 class PipelineIn(_In):
+    name: str
     steps: list[StageIn]
 
 
@@ -146,7 +148,7 @@ def account_errors():
     try:
         yield
     except KeyError as e:
-        raise HTTPException(404, "未知的帳號或節點") from e
+        raise HTTPException(404, "找不到指定的帳號、AI、生產線或任務") from e
     except (ValueError, ConnectorError) as e:
         raise HTTPException(409, str(e)) from e
 
@@ -214,12 +216,18 @@ def create_app(
         if not body.prompt.strip():
             raise HTTPException(422, "任務內容是空的")
         with account_errors():
-            return factory.start_task(body.title.strip() or body.prompt[:20], body.prompt)
+            return factory.start_task(body.title.strip() or body.prompt[:20], body.prompt, body.pipeline)
 
     @app.post("/api/tasks/{task_id}/answer")
     async def answer(task_id: str, body: AnswerIn):
         if not factory.answer(task_id, body.text):
             raise HTTPException(409, "此任務目前沒有待回答的問題")
+        return {"ok": True}
+
+    @app.delete("/api/tasks/{task_id}")
+    async def delete_task(task_id: str):
+        with account_errors():
+            await factory.delete_task(task_id)
         return {"ok": True}
 
     @app.post("/api/tasks/{task_id}/cancel")
@@ -245,10 +253,21 @@ def create_app(
             await factory.remove_node(nid)
         return {"ok": True}
 
-    @app.put("/api/pipeline")
-    async def set_pipeline(body: PipelineIn):
+    @app.post("/api/pipelines")
+    async def add_pipeline(body: PipelineIn):
         with account_errors():
-            return await factory.set_pipeline([s.model_dump() for s in body.steps])
+            return await factory.save_pipeline(None, body.name, [s.model_dump() for s in body.steps])
+
+    @app.put("/api/pipelines/{pid}")
+    async def update_pipeline(pid: str, body: PipelineIn):
+        with account_errors():
+            return await factory.save_pipeline(pid, body.name, [s.model_dump() for s in body.steps])
+
+    @app.delete("/api/pipelines/{pid}")
+    async def delete_pipeline(pid: str):
+        with account_errors():
+            await factory.delete_pipeline(pid)
+        return {"ok": True}
 
     @app.get("/api/ollama/models")
     async def list_ollama_models(host: str = ""):
@@ -318,45 +337,42 @@ def create_app(
     @app.websocket("/ws")
     async def ws(sock: WebSocket):
         await sock.accept()
-        q: asyncio.Queue = asyncio.Queue(maxsize=WS_QUEUE_MAX)
+        q: asyncio.Queue = asyncio.Queue()
         overflow = asyncio.Event()
 
         async def sub(ev: dict) -> None:
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:  # 用戶端跟不上：斷線讓它重連拿新快照
+            if q.qsize() >= WS_QUEUE_MAX:  # 用戶端跟不上：斷線讓它重連拿新快照
                 overflow.set()
-                raise
+                raise OverflowError("websocket 佇列已滿")
+            q.put_nowait(ev)
 
         async def sender() -> None:
-            while True:
-                await sock.send_json(await q.get())
+            while not overflow.is_set():
+                ev = await q.get()
+                if not overflow.is_set():
+                    await sock.send_json(ev)
+            with contextlib.suppress(Exception):
+                await sock.close(1013)
 
-        async def receiver() -> None:
-            # 必須讀 socket 才看得到關閉；否則 Ctrl+C 時會卡在 "Waiting for background tasks"。
-            while (await sock.receive())["type"] != "websocket.disconnect":
-                pass
-
+        send_task: asyncio.Task | None = None
         try:
             await factory.refresh()
             # 訂閱與取快照之間不能有 await：否則快照之前的事件會在快照之後重播，
             # 前端會把上一階段的串流接到新階段後面。
             factory.subscribers.add(sub)
             await sock.send_json({"type": "snapshot", **factory.snapshot()})
-            jobs = [asyncio.create_task(c) for c in (sender(), receiver(), overflow.wait())]
-            done, pending = await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
-            for p in pending:
-                p.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for d in done:
-                d.exception()  # 取出例外，避免 "Task exception was never retrieved"
-            if overflow.is_set():
-                with contextlib.suppress(Exception):
-                    await sock.close(1013)
+            send_task = asyncio.create_task(sender())
+            # 在這個 task 自己讀 socket：斷線（或 Ctrl+C）時立刻結束，不留背景工作。
+            while (await sock.receive())["type"] != "websocket.disconnect":
+                pass
         except (WebSocketDisconnect, RuntimeError):
             pass
         finally:
             factory.subscribers.discard(sub)
+            if send_task:
+                send_task.cancel()
+                # return_exceptions：回收 sender 自己的取消；這個 task 本身被取消時仍照常往外傳。
+                await asyncio.gather(send_task, return_exceptions=True)
 
     app.mount("/assets", StaticFiles(directory=ROOT / "frontend"), name="assets")
 

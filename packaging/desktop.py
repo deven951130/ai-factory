@@ -73,6 +73,7 @@ def main() -> None:
         alert(f"伺服器啟動失敗，詳見 {HOME / 'logs' / 'app.log'}")
         return
 
+    webview.settings["ALLOW_DOWNLOADS"] = True  # 任務結果「下載」：跳出另存新檔
     # 底色和 Oneiroverse 啟動動畫一致，頁面畫出來之前不會先閃一下別的顏色。
     webview.create_window(APP_NAME, f"http://127.0.0.1:{port}/", width=1440, height=900, min_size=(900, 600),
                           background_color="#06162b", text_select=True, zoomable=True)

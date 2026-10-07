@@ -33,11 +33,11 @@ SAMPLE = {
         {"id": "claude-opus-2", "label": "Claude Opus 2", "kind": "claude", "model": "opus", "timeout": 900},
         {"id": "ollama", "label": "本地 Qwen", "kind": "ollama", "model": "qwen2.5-coder:7b", "timeout": 300},
     ],
-    "pipeline": [
+    "pipelines": [{"id": "main", "name": "主線", "steps": [
         {"name": "分析", "node": "gemini", "template": "分析需求：\n\n{input}"},
         {"name": "實作", "node": "claude-opus", "template": "實作：\n\n{input}"},
         {"name": "審查", "node": "claude-opus-2", "template": "審查：\n\n{input}"},
-    ],
+    ]}],
 }
 SAMPLE_NODES = len(SAMPLE["nodes"])
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="假 CLI 用 shebang 腳本")
@@ -184,7 +184,8 @@ def test_unexpected_exception_blocks_task(tmp_path):
 def test_template_with_json_braces(tmp_path):
     async def go():
         f = make(tmp_path)
-        f.pipeline = [{"name": "s", "node": "gemini", "template": '請以 JSON 輸出 {"steps": []}：\n\n{input}'}]
+        f.pipelines = [{"id": "j", "name": "j", "steps": [
+            {"name": "s", "node": "gemini", "template": '請以 JSON 輸出 {"steps": []}：\n\n{input}'}]}]
         seen = []
 
         async def run(prompt, on_chunk):
@@ -288,22 +289,147 @@ def test_task_runs_the_pipeline_it_started_with(tmp_path):
     async def go():
         f = make(tmp_path)
         t = f.create_task("t", "x")
-        await f.set_pipeline([{"name": "只有一步", "node": "ollama", "template": "{input}"}])
+        await f.save_pipeline("main", "主線", [{"name": "只有一步", "node": "ollama", "template": "{input}"}])
         await f.run_task(t["id"])
         return t, f
     t, f = asyncio.run(go())
     assert t["status"] == "done" and [o["stage"] for o in t["outputs"]] == ["分析", "實作", "審查"]
-    assert [s["name"] for s in f.pipeline] == ["只有一步"]
+    assert [s["name"] for s in f.pipelines[0]["steps"]] == ["只有一步"]
+
+
+def test_task_placeholder_gives_later_stages_the_original_request(tmp_path):
+    async def go():
+        f = make(tmp_path)
+        await f.save_pipeline("main", "主線", [
+            {"name": "實作", "node": "gemini", "template": "實作：{input}"},
+            {"name": "審查", "node": "ollama", "template": "原始需求：{task}\n實作結果：{input}"}])
+        seen = {}
+
+        async def gem(prompt, on_chunk):
+            return "程式碼 {task} {input}"  # 輸出裡剛好有大括號：不能再被替換
+
+        async def oll(prompt, on_chunk):
+            seen["p"] = prompt
+            return "ok"
+        f.connectors["gemini"].run = gem
+        f.connectors["ollama"].run = oll
+        t = f.create_task("t", "做貪食蛇")
+        await f.run_task(t["id"])
+        only_task = await f.save_pipeline(None, "直接問", [{"name": "答", "node": "ollama", "template": "{task}"}])
+        return t, seen["p"], only_task
+    t, prompt, only_task = asyncio.run(go())
+    assert t["status"] == "done"
+    assert prompt.startswith("原始需求：做貪食蛇\n實作結果：程式碼 {task} {input}")
+    assert only_task["steps"][0]["template"] == "{task}"  # 只用 {task} 也可以
+
+
+def test_task_history_survives_restart(tmp_path):
+    async def go():
+        f = make(tmp_path)
+        done = f.create_task("完成的", "x")
+        await f.run_task(done["id"])
+        f.create_task("沒跑完的", "y")  # 關閉軟體時還在進行中
+    asyncio.run(go())
+    f2 = Factory(tmp_path / "nodes.json", tmp_path, force_fake=True)
+    by_title = {t["title"]: t for t in f2.tasks.values()}
+    assert by_title["完成的"]["status"] == "done" and len(by_title["完成的"]["outputs"]) == 3
+    assert by_title["完成的"]["finished_at"] and by_title["完成的"]["pipeline"]["name"] == "主線"
+    assert by_title["沒跑完的"]["status"] == "interrupted" and "還沒完成" in by_title["沒跑完的"]["error"]
+    assert (tmp_path / "fake-tasks.json").exists() and not (tmp_path / "tasks.json").exists()  # 示範任務分開存
+
+
+def test_delete_task_and_history_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr("backend.factory.TASKS_KEEP", 3)
+    app = sample_app(tmp_path)
+    with TestClient(app, base_url=LOCAL) as c:
+        f = app.state.factory
+        ids = []
+        for i in range(5):
+            ids.append(c.post("/api/tasks", json={"title": f"t{i}", "prompt": "x"}).json()["id"])
+            poll(lambda: f.tasks[ids[-1]]["status"] == "done")
+        assert len(f.tasks) <= 4 and ids[0] not in f.tasks and ids[-1] in f.tasks  # 超過上限時刪最舊的
+
+        async def hang(prompt, on_chunk):
+            await asyncio.sleep(60)
+        f.connectors["gemini"].run = hang
+        running = c.post("/api/tasks", json={"title": "跑很久", "prompt": "x"}).json()["id"]
+        poll(lambda: f.tasks[running]["status"] == "running")
+        assert c.delete(f"/api/tasks/{running}").status_code == 409  # 進行中不能刪
+        assert c.post(f"/api/tasks/{running}/cancel").status_code == 200
+        poll(lambda: f.tasks[running]["status"] == "cancelled")
+        with c.websocket_connect("/ws", headers=WS_HOST) as ws:
+            assert ws.receive_json()["type"] == "snapshot"
+            assert c.delete(f"/api/tasks/{ids[-1]}").status_code == 200
+            while (ev := ws.receive_json())["type"] != "task_removed":
+                pass
+            assert ev["id"] == ids[-1] and ids[-1] not in f.tasks
+        assert c.delete("/api/tasks/nope").status_code == 404
+    saved = json.loads((tmp_path / "fake-tasks.json").read_text(encoding="utf-8"))
+    assert ids[-1] not in [t["id"] for t in saved]
+
+
+def test_multiple_pipelines_and_task_choice(tmp_path):
+    app = sample_app(tmp_path)
+    with TestClient(app, base_url=LOCAL) as c:
+        f = app.state.factory
+        p = c.post("/api/pipelines", json={"name": "只問本地", "steps": [
+            {"name": "回答", "node": "ollama", "template": "{task}"}]}).json()
+        assert p["id"].startswith("p-") and [x["name"] for x in f.pipelines] == ["主線", "只問本地"]
+        assert c.post("/api/pipelines", json={"name": "只問本地", "steps": []}).status_code == 409  # 同名
+        assert c.post("/api/pipelines", json={"name": " ", "steps": []}).status_code == 409
+        t = c.post("/api/tasks", json={"title": "", "prompt": "hi", "pipeline": p["id"]}).json()
+        assert t["pipeline"] == {"id": p["id"], "name": "只問本地"} and [s["node"] for s in t["steps"]] == ["ollama"]
+        poll(lambda: f.tasks[t["id"]]["status"] == "done")
+        default = c.post("/api/tasks", json={"title": "", "prompt": "hi"}).json()  # 沒指定 → 第一條
+        assert default["pipeline"]["id"] == "main"
+        assert c.post("/api/tasks", json={"title": "", "prompt": "x", "pipeline": "nope"}).status_code == 404
+        empty = c.post("/api/pipelines", json={"name": "空的", "steps": []}).json()
+        r = c.post("/api/tasks", json={"title": "", "prompt": "x", "pipeline": empty["id"]})
+        assert r.status_code == 409 and "還沒有任何階段" in r.json()["detail"]
+        assert c.delete(f"/api/pipelines/{p['id']}").status_code == 200
+        assert c.delete("/api/pipelines/nope").status_code == 404
+    saved = json.loads((tmp_path / "nodes.json").read_text(encoding="utf-8"))
+    assert [x["name"] for x in saved["pipelines"]] == ["主線", "空的"]
+
+
+def test_legacy_single_pipeline_is_migrated(tmp_path):
+    legacy = {"nodes": SAMPLE["nodes"], "pipeline": SAMPLE["pipelines"][0]["steps"]}
+    f = Factory(write_sample(tmp_path / "nodes.json", legacy), tmp_path, force_fake=True)
+    assert [p["id"] for p in f.pipelines] == ["main"] and len(f.pipelines[0]["steps"]) == 3
+    saved = json.loads((tmp_path / "nodes.json").read_text(encoding="utf-8"))
+    assert "pipeline" not in saved and saved["pipelines"][0]["id"] == "main"
+
+
+def test_api_keys_are_encrypted_at_rest(tmp_path):
+    from backend.accounts import Accounts
+    acc = Accounts(tmp_path / "accounts.json", {}, tmp_path / "acc")
+    aid = acc.add("金鑰", "openai")["id"]
+    acc.set_key(aid, "sk-test-secret-5678")
+    raw = (tmp_path / "accounts.json").read_text(encoding="utf-8")
+    assert Accounts(tmp_path / "accounts.json", {}, tmp_path / "acc").items[aid]["key"] == "sk-test-secret-5678"
+    if sys.platform != "win32":
+        return
+    assert "sk-test-secret-5678" not in raw and '"dpapi:' in raw
+    legacy = tmp_path / "legacy.json"  # 0.2.0 存的明文：讀進來就改存加密
+    legacy.write_text(json.dumps({"accounts": [{"id": "x", "name": "x", "provider": "openai", "key": "plain-key-0000"}]}),
+                      encoding="utf-8")
+    assert Accounts(legacy, {}, tmp_path / "acc").items["x"]["key"] == "plain-key-0000"
+    assert "plain-key-0000" not in legacy.read_text(encoding="utf-8")
+    bad = tmp_path / "bad.json"  # 解不開（例如從別台電腦複製來）→ 要求重新輸入
+    bad.write_text(json.dumps({"accounts": [{"id": "y", "name": "y", "provider": "gemini", "config_dir": str(tmp_path),
+                                             "key": "dpapi:AAAA"}]}), encoding="utf-8")
+    b = Accounts(bad, {}, tmp_path / "acc")
+    assert b.items["y"]["key"] == "" and "重新輸入" in b.errors["y"]
 
 
 # ---------------- 節點 / 生產線設定 ----------------
 
 def test_fresh_install_starts_empty(tmp_path):
-    assert json.loads((ROOT / "nodes.json").read_text(encoding="utf-8")) == {"nodes": [], "pipeline": []}
+    assert json.loads((ROOT / "nodes.json").read_text(encoding="utf-8")) == {"nodes": [], "pipelines": []}
     app = create_app(force_fake=True, data_dir=tmp_path)
     with TestClient(app, base_url=LOCAL) as c:
         st = c.get("/api/state").json()
-        assert st["nodes"] == [] and st["pipeline"] == [] and st["accounts"] == []
+        assert st["nodes"] == [] and st["pipelines"] == [] and st["accounts"] == []
         r = c.post("/api/tasks", json={"title": "", "prompt": "x"})
         assert r.status_code == 409 and "生產線" in r.json()["detail"]
     assert (tmp_path / "nodes.json").exists()  # 設定檔放在資料夾，不改 repo 的預設
@@ -342,23 +468,26 @@ def test_node_and_pipeline_editing(tmp_path):
         assert r.status_code == 200 and r.json()["label"] == "本地 Llama" and f.connectors[nid].model == "qwen3:8b"
         assert c.patch("/api/nodes/nope", json={"model": "x"}).status_code == 404
 
-        bad = c.put("/api/pipeline", json={"steps": [{"name": "a", "node": nid, "template": "沒有輸入"}]})
-        assert bad.status_code == 409 and "{input}" in bad.json()["detail"]
-        assert c.put("/api/pipeline", json={"steps": [{"name": "a", "node": "nope", "template": "{input}"}]}).status_code == 409
-        ok = c.put("/api/pipeline", json={"steps": [{"name": "草稿", "node": nid, "template": "寫：{input}"},
-                                                    {"name": "審查", "node": "gemini", "template": "{input}"}]})
-        assert ok.status_code == 200 and [s["name"] for s in f.pipeline] == ["草稿", "審查"]
-        assert json.loads(cfg.read_text(encoding="utf-8"))["pipeline"][0]["node"] == nid
+        bad = c.put("/api/pipelines/main", json={"name": "主線", "steps": [
+            {"name": "a", "node": nid, "template": "沒有輸入"}]})
+        assert bad.status_code == 409 and "{input}" in bad.json()["detail"] and "{task}" in bad.json()["detail"]
+        assert c.put("/api/pipelines/main", json={"name": "主線", "steps": [
+            {"name": "a", "node": "nope", "template": "{input}"}]}).status_code == 409
+        assert c.put("/api/pipelines/nope", json={"name": "x", "steps": []}).status_code == 404
+        ok = c.put("/api/pipelines/main", json={"name": "主線", "steps": [
+            {"name": "草稿", "node": nid, "template": "寫：{input}"}, {"name": "審查", "node": "gemini", "template": "{input}"}]})
+        assert ok.status_code == 200 and [s["name"] for s in f.pipelines[0]["steps"]] == ["草稿", "審查"]
+        assert json.loads(cfg.read_text(encoding="utf-8"))["pipelines"][0]["steps"][0]["node"] == nid
 
         r = c.delete(f"/api/nodes/{nid}")  # 生產線還在用
-        assert r.status_code == 409 and "草稿" in r.json()["detail"]
-        assert c.put("/api/pipeline", json={"steps": []}).status_code == 200
+        assert r.status_code == 409 and "主線" in r.json()["detail"] and "草稿" in r.json()["detail"]
+        assert c.put("/api/pipelines/main", json={"name": "主線", "steps": []}).status_code == 200
         assert c.delete(f"/api/nodes/{nid}").status_code == 200
         assert nid not in f.nodes and nid not in json.loads(cfg.read_text(encoding="utf-8"))["nodes"]
 
     # 重啟後設定還在
     f2 = create_app(force_fake=True, data_dir=tmp_path).state.factory
-    assert f2.pipeline == [] and len(f2.nodes) == SAMPLE_NODES
+    assert f2.pipelines[0]["steps"] == [] and len(f2.nodes) == SAMPLE_NODES
 
 
 def test_legacy_account_assignments_are_migrated(tmp_path):
@@ -605,6 +734,7 @@ def test_accounts_add_login_assign_remove(tmp_path):
         assert c.post(f"/api/accounts/{aid}/code", json={"code": "ok"}).status_code == 200
         poll(lambda: f.nodes["claude-opus-2"]["status"] == "idle")
         assert f.accounts.status[aid]["email"] == f"{aid}@example.com" and not f.accounts.errors.get(aid)
+        assert f.nodes["claude-opus-2"]["detail"] == f"{aid}@example.com · pro"  # 卡片顯示帳號，不是執行檔路徑
 
         assert c.post("/api/accounts/nope/login").status_code == 404
         assert c.post(f"/api/accounts/{aid}/key", json={"key": "abc"}).status_code == 409  # Claude 不用金鑰

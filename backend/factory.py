@@ -27,6 +27,10 @@ ASK_HINT = (
 ASK_FINAL = "\n\n（已無法再提問，請依現有資訊直接完成。）"
 MAX_RETRY = 2
 MAX_ASKS = 3  # 每個階段最多問使用者幾次，避免無限追問
+# 階段指令裡的 {input} = 上一階段的輸出（第一階段是任務內容），{task} = 原始任務內容。
+PLACEHOLDER_RE = re.compile(r"\{(input|task)\}")
+ACTIVE = ("queued", "running", "waiting_user")
+TASKS_KEEP = 200  # 任務歷史最多保留幾筆（超過時刪最舊的已結束任務）
 
 # 每種 AI 用哪一類帳號；optional：可以不指定帳號（例如本機的 OpenAI 相容伺服器不需要金鑰）。
 KINDS = {
@@ -38,6 +42,7 @@ KINDS = {
 }
 LABEL_MAX, ROLE_MAX, MODEL_MAX, ADDR_MAX = 40, 60, 100, 300
 STAGE_NAME_MAX, TEMPLATE_MAX, STAGES_MAX = 30, 8000, 20
+PIPE_NAME_MAX, PIPES_MAX = 30, 30
 TIMEOUT_RANGE = (30, 3600)
 SPEC_FIELDS = ("label", "model", "role", "timeout", "account", "host", "base_url")
 
@@ -67,7 +72,7 @@ class Factory:
         # utf-8-sig：Windows 記事本 / PowerShell 5.1 存檔常帶 BOM。
         cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
         self.specs: dict[str, dict] = {n["id"]: n for n in cfg.get("nodes", []) if n.get("kind") in KINDS}
-        self.pipeline: list[dict] = [s for s in cfg.get("pipeline", []) if s.get("node") in self.specs]
+        self.pipelines: list[dict] = self._load_pipelines(cfg)
         data_dir.mkdir(parents=True, exist_ok=True)
         self.workdir = data_dir / "workspace"  # CLI 在空資料夾執行，讀不到本專案與事件紀錄
         self.workdir.mkdir(exist_ok=True)
@@ -81,6 +86,9 @@ class Factory:
         self.subscribers: set[Emit] = set()
         self.data_dir = data_dir
         self._log_file = data_dir / "events.jsonl"
+        # 模擬模式的示範任務不混進真正的任務歷史
+        self._tasks_file = data_dir / ("fake-tasks.json" if force_fake else "tasks.json")
+        self._load_tasks()
         if force_fake:  # 模擬模式不碰真正的 CLI、帳號清單與家目錄
             fake = FakeAuth()
             self.accounts = Accounts(data_dir / "fake-accounts.json", {"claude": fake, "codex": fake},
@@ -90,13 +98,30 @@ class Factory:
                                      {"claude": ClaudeAuth(self.workdir), "codex": CodexAuth(self.workdir)},
                                      data_dir / "accounts")
         self.accounts.on_change = self.accounts_changed
-        if self._migrate_accounts():
-            self._write_config(self.specs, self.pipeline)
+        if self._migrate_accounts() or "pipelines" not in cfg:
+            self._write_config(self.specs, self.pipelines)
         for nid in self.specs:
             self._mount(nid)
         self._apply_accounts()
 
     # ---------- 設定 ----------
+    def _load_pipelines(self, cfg: dict) -> list[dict]:
+        raw = cfg.get("pipelines")
+        if raw is None:  # 0.2.0 以前只有一條生產線
+            raw = [{"id": "main", "name": "生產線", "steps": cfg["pipeline"]}] if cfg.get("pipeline") else []
+        out = []
+        for p in raw:
+            if isinstance(p, dict) and p.get("id"):
+                steps = [s for s in p.get("steps", []) if s.get("node") in self.specs]
+                out.append({"id": p["id"], "name": p.get("name") or "生產線", "steps": steps})
+        return out
+
+    def _pipeline(self, pid: str) -> dict:
+        for p in self.pipelines:
+            if p["id"] == pid:
+                return p
+        raise KeyError(pid)
+
     def _migrate_accounts(self) -> bool:
         """舊版把 Claude 節點的帳號分配存在 accounts.json；搬進節點設定。"""
         moved = False
@@ -106,8 +131,8 @@ class Factory:
                 moved = True
         return moved
 
-    def _write_config(self, specs: dict[str, dict], pipeline: list[dict]) -> None:
-        data = {"nodes": list(specs.values()), "pipeline": pipeline}
+    def _write_config(self, specs: dict[str, dict], pipelines: list[dict]) -> None:
+        data = {"nodes": list(specs.values()), "pipelines": pipelines}
         tmp = self.config_path.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -136,11 +161,11 @@ class Factory:
         return [dict(self.nodes[nid]) for nid in self.specs]
 
     def snapshot(self) -> dict:
-        return {"nodes": self._public_nodes(), "tasks": list(self.tasks.values()), "pipeline": self.pipeline,
+        return {"nodes": self._public_nodes(), "tasks": list(self.tasks.values()), "pipelines": self.pipelines,
                 "accounts": self.accounts.public()}
 
     async def _config_changed(self) -> None:
-        await self.emit({"type": "config", "nodes": self._public_nodes(), "pipeline": self.pipeline}, persist=False)
+        await self.emit({"type": "config", "nodes": self._public_nodes(), "pipelines": self.pipelines}, persist=False)
 
     def _validate_node(self, kind: str, data: dict, nid: str | None) -> dict:
         meta = KINDS.get(kind)
@@ -183,7 +208,7 @@ class Factory:
         nid = f"{kind}-{uuid.uuid4().hex[:6]}"
         spec = self._validate_node(kind, data, nid)
         specs = {**self.specs, nid: spec}
-        self._write_config(specs, self.pipeline)
+        self._write_config(specs, self.pipelines)
         self.specs = specs
         self._mount(nid)
         self._apply_accounts()
@@ -198,7 +223,7 @@ class Factory:
         if "extra" in old:  # 手動寫在設定檔裡的進階選項
             spec["extra"] = old["extra"]
         specs = {**self.specs, nid: spec}
-        self._write_config(specs, self.pipeline)
+        self._write_config(specs, self.pipelines)
         self.specs = specs
         self._mount(nid)  # 換新的連接器；執行中的呼叫繼續用舊的，鎖沿用同一把
         self._apply_accounts()
@@ -208,21 +233,22 @@ class Factory:
 
     async def remove_node(self, nid: str) -> None:
         self.specs[nid]  # 不存在 → KeyError
-        used = [s["name"] for s in self.pipeline if s["node"] == nid]
-        if used:
-            raise ValueError(f"生產線的「{used[0]}」階段正在使用這個 AI，請先修改生產線")
+        for p in self.pipelines:
+            for step in p["steps"]:
+                if step["node"] == nid:
+                    raise ValueError(f"生產線「{p['name']}」的「{step['name']}」階段正在使用這個 AI，請先修改生產線")
         busy = self.nodes[nid]["status"] in ("running", "waiting") or self._lock[nid].locked() or any(
             nid in (s["node"] for s in steps) for tid, steps in self._task_steps.items() if tid in self.jobs)
         if busy:
             raise ValueError("這個 AI 還有任務在用，請等任務結束或取消後再刪除")
         specs = {i: s for i, s in self.specs.items() if i != nid}
-        self._write_config(specs, self.pipeline)
+        self._write_config(specs, self.pipelines)
         self.specs = specs
         for d in (self.connectors, self.nodes, self._lock):
             d.pop(nid, None)
         await self._config_changed()
 
-    async def set_pipeline(self, steps: list[dict]) -> list[dict]:
+    def _clean_steps(self, steps: list[dict]) -> list[dict]:
         if len(steps) > STAGES_MAX:
             raise ValueError(f"最多 {STAGES_MAX} 個階段")
         clean = []
@@ -235,13 +261,36 @@ class Factory:
                 raise ValueError(f"第 {i} 階段「{name}」的指令是空的")
             if len(template) > TEMPLATE_MAX:
                 raise ValueError(f"第 {i} 階段「{name}」的指令太長（最多 {TEMPLATE_MAX} 字）")
-            if "{input}" not in template:
-                raise ValueError(f"第 {i} 階段「{name}」的指令要包含 {{input}}（代表上一階段的輸出）")
+            if not PLACEHOLDER_RE.search(template):
+                raise ValueError(f"第 {i} 階段「{name}」的指令要包含 {{input}}（上一階段的輸出）或 {{task}}（原始任務）")
             clean.append({"name": name, "node": s["node"], "template": template})
-        self._write_config(self.specs, clean)
-        self.pipeline = clean
-        await self._config_changed()
         return clean
+
+    async def save_pipeline(self, pid: str | None, name: str, steps: list[dict]) -> dict:
+        """pid=None 新增一條生產線，否則修改它。"""
+        name = _text(name, PIPE_NAME_MAX, "生產線名稱", required=True)
+        if any(p["name"] == name and p["id"] != pid for p in self.pipelines):
+            raise ValueError("已經有同名的生產線")
+        p = {"id": pid, "name": name, "steps": self._clean_steps(steps)}
+        if pid is None:
+            if len(self.pipelines) >= PIPES_MAX:
+                raise ValueError(f"最多 {PIPES_MAX} 條生產線")
+            p["id"] = f"p-{uuid.uuid4().hex[:6]}"
+            pipelines = [*self.pipelines, p]
+        else:
+            self._pipeline(pid)  # 不存在 → KeyError
+            pipelines = [p if x["id"] == pid else x for x in self.pipelines]
+        self._write_config(self.specs, pipelines)
+        self.pipelines = pipelines
+        await self._config_changed()
+        return p
+
+    async def delete_pipeline(self, pid: str) -> None:
+        self._pipeline(pid)  # 不存在 → KeyError；進行中的任務用的是建立時的副本，不受影響
+        pipelines = [p for p in self.pipelines if p["id"] != pid]
+        self._write_config(self.specs, pipelines)
+        self.pipelines = pipelines
+        await self._config_changed()
 
     # ---------- 事件 ----------
     async def emit(self, event: dict, persist: bool = True) -> None:
@@ -300,6 +349,16 @@ class Factory:
             return f"帳號「{a['name']}」未登入"
         return ""
 
+    def _account_summary(self, nid: str) -> str:
+        """節點卡片上顯示用：帳號的 email / 方案，或金鑰已設定。"""
+        a = self.accounts.items.get(self.specs[nid].get("account") or "")
+        if not a:
+            return ""
+        st = self.accounts.status.get(a["id"]) or {}
+        if st.get("email"):
+            return st["email"] + (f" · {st['plan']}" if st.get("plan") else "")
+        return "API 金鑰已設定" if a["key"] else ""
+
     async def accounts_changed(self) -> None:
         self._apply_accounts()
         await self.refresh()
@@ -310,7 +369,7 @@ class Factory:
         used = [nid for nid, s in self.specs.items() if s.get("account") == aid]
         if used:
             specs = {nid: ({**s, "account": None} if nid in used else s) for nid, s in self.specs.items()}
-            self._write_config(specs, self.pipeline)
+            self._write_config(specs, self.pipelines)
             self.specs = specs
             for nid in used:
                 self._sync(nid)
@@ -326,6 +385,8 @@ class Factory:
                 continue  # 偵測期間節點被刪除或換了設定
             if ok and (problem := self._account_problem(nid)):
                 ok, detail = False, problem
+            elif ok and self.specs[nid]["kind"] in ("claude", "codex", "gemini"):
+                detail = self._account_summary(nid) or detail  # 卡片上顯示用哪個帳號
             n = self.nodes[nid]
             before = (n["status"], n["detail"], n["models"], n["effective_model"])
             self._sync(nid)
@@ -412,27 +473,71 @@ class Factory:
         return reply
 
     # ---------- 任務管線 ----------
-    def create_task(self, title: str, prompt: str) -> dict:
-        if not self.pipeline:
-            raise ValueError("生產線還沒有任何階段，請先在「生產線」按「編輯」設定")
-        steps = [dict(s) for s in self.pipeline]  # 任務照建立當下的生產線跑，之後改設定不影響它
+    def _load_tasks(self) -> None:
+        """讀回任務歷史；軟體關閉時還沒完成的任務標成「已中斷」。"""
+        try:
+            raw = json.loads(self._tasks_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            print(f"[factory] {self._tasks_file} 讀取失敗，任務歷史從空白開始：{e}", file=sys.stderr)
+            return
+        for t in raw if isinstance(raw, list) else []:
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            if t.get("status") in ACTIVE:
+                t.update(status="interrupted", stage=None, question=None,
+                         error=t.get("error") or "軟體關閉時這個任務還沒完成")
+            self.tasks[t["id"]] = t
+
+    def _save_tasks(self) -> None:
+        if len(self.tasks) > TASKS_KEEP:
+            ended = sorted((t for t in self.tasks.values() if t["status"] not in ACTIVE), key=lambda t: t["created_at"])
+            for t in ended[:len(self.tasks) - TASKS_KEEP]:
+                del self.tasks[t["id"]]
+        tmp = self._tasks_file.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(list(self.tasks.values()), ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._tasks_file)
+        except (OSError, UnicodeError) as e:  # 存不了歷史不能影響任務本身
+            print(f"[factory] 任務歷史寫入失敗：{e}", file=sys.stderr)
+
+    def create_task(self, title: str, prompt: str, pipeline_id: str | None = None) -> dict:
+        if not self.pipelines:
+            raise ValueError("還沒有生產線，請先在「生產線」按「＋ 新增生產線」")
+        p = self._pipeline(pipeline_id) if pipeline_id else self.pipelines[0]  # 不存在 → KeyError
+        if not p["steps"]:
+            raise ValueError(f"生產線「{p['name']}」還沒有任何階段")
+        steps = [dict(s) for s in p["steps"]]  # 任務照建立當下的生產線跑，之後改設定不影響它
         t = {"id": uuid.uuid4().hex[:8], "title": title, "prompt": prompt, "status": "queued",
+             "pipeline": {"id": p["id"], "name": p["name"]},
              "stage": None, "stage_index": -1, "steps": [{"name": s["name"], "node": s["node"]} for s in steps],
-             "outputs": [], "question": None, "error": None, "created_at": time.time()}
+             "outputs": [], "question": None, "error": None, "created_at": time.time(), "finished_at": None}
         self.tasks[t["id"]] = t
         self._task_steps[t["id"]] = steps
+        self._save_tasks()
         return t
 
-    def start_task(self, title: str, prompt: str) -> dict:
-        t = self.create_task(title, prompt)
+    def start_task(self, title: str, prompt: str, pipeline_id: str | None = None) -> dict:
+        t = self.create_task(title, prompt, pipeline_id)
         job = asyncio.create_task(self.run_task(t["id"]))
         self.jobs[t["id"]] = job
         job.add_done_callback(lambda _: self.jobs.pop(t["id"], None))
         return t
 
+    async def delete_task(self, task_id: str) -> None:
+        t = self.tasks[task_id]  # 不存在 → KeyError
+        if t["status"] in ACTIVE:
+            raise ValueError("任務還在進行中，請先取消")
+        del self.tasks[task_id]
+        self._save_tasks()
+        await self.emit({"type": "task_removed", "id": task_id}, persist=False)
+
     async def _run_stage(self, t: dict, step: dict, data: str) -> str:
-        # 用 replace 而不是 str.format：模板裡的 JSON 大括號不會被當成欄位。
-        base = step["template"].replace("{input}", data)
+        # 一次替換完：插進去的內容（例如上一階段輸出裡剛好有 {task}）不會再被當成欄位；
+        # 也不用 str.format，模板裡的 JSON 大括號不受影響。
+        values = {"input": data, "task": t["prompt"]}
+        base = PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], step["template"])
         qa: list[tuple[str, str]] = []
         while True:
             extra = "".join(f"\n\n補充資訊（你問「{q}」，使用者回答）：{a}" for q, a in qa)
@@ -455,6 +560,7 @@ class Factory:
                 await self.emit({"type": "task", "task": dict(t)})
                 out = await self._run_stage(t, step, data)
                 t["outputs"].append({"stage": step["name"], "node": step["node"], "text": out})
+                self._save_tasks()
                 data = out
             t.update(status="done", stage=None)
         except asyncio.CancelledError:
@@ -467,12 +573,15 @@ class Factory:
         finally:
             self.questions.pop(task_id, None)
             self._task_steps.pop(task_id, None)
+            t["finished_at"] = time.time()
+            self._save_tasks()
             await self.emit({"type": "task", "task": dict(t)})
 
     async def _ask_user(self, task: dict, nid: str, question: str) -> str:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self.questions[task["id"]] = fut
         task.update(status="waiting_user", question={"node": nid, "text": question})
+        self._save_tasks()
         await self._set(nid, "waiting", "等待你的回答", task["id"])
         await self.emit({"type": "task", "task": dict(task)})
         await self.emit({"type": "ask", "task_id": task["id"], "node": nid, "text": question})

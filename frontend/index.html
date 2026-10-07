@@ -37,7 +37,12 @@
   .task { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:8px; }
   .badge { font-size:11px; padding:1px 8px; border-radius:10px; background:var(--line); }
   .badge.running{background:var(--run)} .badge.done{background:var(--done);color:#000} .badge.blocked{background:var(--fail)} .badge.waiting_user{background:var(--wait);color:#000}
-  .badge.cancelled{background:var(--off)}
+  .badge.cancelled, .badge.interrupted {background:var(--off)}
+  .pipe { margin-bottom:12px; } .pipe:last-child { margin-bottom:0; }
+  .pipe-head { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .task .meta { font-size:12px; color:var(--mute); }
+  .task .acts { float:right; display:flex; gap:4px; }
+  .task details summary { cursor:pointer; font-size:12px; color:var(--mute); margin-top:6px; }
   .ask { border:2px solid var(--wait); background:#f59e0b14; border-radius:10px; padding:10px; margin-bottom:10px; }
   input,textarea,select,button { font:inherit; color:var(--text); background:#0f1218; border:1px solid var(--line); border-radius:6px; padding:7px 9px; }
   button { background:var(--run); border-color:var(--run); cursor:pointer; } button:disabled{opacity:.5; cursor:default}
@@ -82,15 +87,15 @@
       <div id="factory"></div>
       <div id="node-editor" class="panel" hidden></div>
     </section>
-    <section><h2>生產線 <button class="ghost" id="edit-pipe">編輯</button></h2>
-      <div id="belt" class="belt"></div>
+    <section><h2>生產線 <button class="ghost" id="new-pipe">＋ 新增生產線</button></h2>
+      <div id="belts"></div>
       <div id="pipe-editor" class="panel" hidden></div>
     </section>
     <section><h2>任務</h2>
       <div id="asks"></div>
       <input id="title" placeholder="任務標題（可留空）" style="width:100%;margin-bottom:6px">
       <textarea id="prompt" rows="3"></textarea>
-      <div class="row"><button id="go">送進工廠</button></div>
+      <div class="row"><select id="task-pipe" title="要跑哪一條生產線" style="flex:1;min-width:0"></select><button id="go">送進工廠</button></div>
       <div id="tasks" style="margin-top:12px"></div>
     </section>
   </div>
@@ -119,13 +124,13 @@
 </main>
 <script>
 const $ = s => document.querySelector(s);
-const S = { nodes:{}, tasks:{}, pipeline:[], accounts:[] };
+const S = { nodes:{}, tasks:{}, pipelines:[], accounts:[] };
 const bubbles = new Map();   // node id -> 正在串流的對話泡泡（每個節點各自一個）
 const taskLive = new Map();  // task id -> 目前階段的即時輸出
 
 const esc = t => String(t ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const STATUS = { idle:'閒置', running:'執行中', waiting:'等你回答', failed:'失敗', offline:'離線' };
-const TASK_STATUS = { queued:'排隊', running:'進行中', waiting_user:'等你回答', done:'完成', blocked:'已阻擋', cancelled:'已取消' };
+const TASK_STATUS = { queued:'排隊', running:'進行中', waiting_user:'等你回答', done:'完成', blocked:'已阻擋', cancelled:'已取消', interrupted:'已中斷' };
 const KINDS = {
   claude: { name:'Claude', provider:'claude', models:['sonnet','opus','haiku'], hint:'sonnet / opus / haiku（留空 = sonnet）' },
   codex:  { name:'ChatGPT（Codex）', provider:'codex', models:[], hint:'留空 = Codex 預設模型' },
@@ -162,41 +167,75 @@ function nodeCard(n) {
 }
 
 function renderGuide() {
-  const nodes = Object.values(S.nodes);
-  if (nodes.length && S.pipeline.length) return setHTML($('#guide'), '');
+  const nodes = Object.values(S.nodes), hasPipe = S.pipelines.some(p => p.steps.length);
+  if (nodes.length && hasPipe) return setHTML($('#guide'), '');
   const steps = [
     [S.accounts.some(a => a.status?.logged_in) || nodes.some(n => n.kind === 'ollama'), '在右邊「AI 帳號」新增帳號並登入（只用本地模型可以跳過）'],
     [nodes.length > 0, '按「＋ 新增 AI」加入要用的 AI，選擇它的帳號，或選本地模型'],
-    [S.pipeline.length > 0, '在「生產線」按「編輯」，設定每個階段由哪個 AI 做什麼'],
+    [hasPipe, '在「生產線」按「＋ 新增生產線」，設定每個階段由哪個 AI 做什麼'],
   ];
   setHTML($('#guide'), `<div class="guide"><b>開始使用</b>${steps.map(([ok, t], i) =>
     `<div class="${ok ? 'ok' : 'todo'}">${ok ? '✓' : (i + 1) + '.'} ${esc(t)}</div>`).join('')}</div>`);
+}
+
+const LIVE = ['queued', 'running', 'waiting_user'];
+const openTasks = new Set();  // 展開結果的已結束任務（重畫時保持展開）
+const stepKey = steps => JSON.stringify(steps.map(s => [s.name, s.node]));
+
+function taskCard(t) {
+  const live = LIVE.includes(t.status), id = esc(t.id);
+  const when = new Date(t.created_at * 1000).toLocaleString('zh-TW', { hour12: false });
+  const acts = live ? `<button class="ghost" data-cancel="${id}">取消</button>`
+    : `<button class="ghost" data-task-copy="${id}">複製</button><button class="ghost" data-task-save="${id}">下載</button>`
+      + `<button class="ghost" data-task-del="${id}">刪除</button>`;
+  const outs = t.outputs.map(o => `<div class="out"><b>${esc(o.stage)} · ${esc(label(o.node))}</b>\n${esc(o.text)}</div>`).join('');
+  return `<div class="task"><span class="acts">${acts}</span><b>${esc(t.title)}</b>
+    <span class="badge ${esc(t.status)}">${esc(TASK_STATUS[t.status]||t.status)}</span> ${t.stage ? '· '+esc(t.stage) : ''}
+    <div class="meta">${esc(t.pipeline?.name || '')}${t.pipeline ? ' · ' : ''}${esc(when)}</div>
+    ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
+    ${live ? outs + `<div class="out live" id="tl-${id}">${esc(taskLive.get(t.id)||'')}</div>`
+      : t.outputs.length ? `<details data-task="${id}"${openTasks.has(t.id) ? ' open' : ''}><summary>結果（${t.outputs.length} 個階段）</summary>${outs}</details>` : ''}</div>`;
 }
 
 function render() {
   renderGuide();
   const nodes = Object.values(S.nodes);
   setHTML($('#factory'), nodes.length ? nodes.map(nodeCard).join('') : '<div class="hint">還沒有 AI，按右上角「＋ 新增 AI」。</div>');
-  const active = Object.values(S.tasks).find(t => ['running','waiting_user'].includes(t.status));
-  const same = active && JSON.stringify(active.steps) === JSON.stringify(S.pipeline.map(s => ({name: s.name, node: s.node})));
-  setHTML($('#belt'), S.pipeline.length ? S.pipeline.map((s,i) => {
-    const cls = same ? (i < active.stage_index ? 'past' : i === active.stage_index ? 'current' : '') : '';
-    return `<span class="stage ${cls}">${esc(s.name)} · ${esc(label(s.node))}</span>`;
-  }).join('<span class="arrow">→</span>') : '<span class="hint">還沒有設定階段，按右上角「編輯」。</span>');
-  const ph = S.pipeline.length ? `描述需求，送進生產線（${S.pipeline.map(s => s.name).join(' → ')}）` : '先在「生產線」設定階段，再把需求送進工廠';
+  const active = Object.values(S.tasks).filter(t => ['running','waiting_user'].includes(t.status));
+  setHTML($('#belts'), S.pipelines.length ? S.pipelines.map(p => {
+    const a = active.find(t => t.pipeline?.id === p.id && stepKey(t.steps) === stepKey(p.steps));
+    const chips = p.steps.length ? p.steps.map((s, i) => {
+      const cls = a ? (i < a.stage_index ? 'past' : i === a.stage_index ? 'current' : '') : '';
+      return `<span class="stage ${cls}">${esc(s.name)} · ${esc(label(s.node))}</span>`;
+    }).join('<span class="arrow">→</span>') : '<span class="hint">還沒有階段</span>';
+    return `<div class="pipe"><div class="pipe-head"><b>${esc(p.name)}</b>
+      <button class="ghost" data-pedit="${esc(p.id)}"${pipe ? ' disabled' : ''}>編輯</button></div><div class="belt">${chips}</div></div>`;
+  }).join('') : '<span class="hint">還沒有生產線，按右上角「＋ 新增生產線」。</span>');
+  const sel = S.pipelines.find(p => p.id === $('#task-pipe').value);
+  const ph = sel ? `描述需求，送進「${sel.name}」（${sel.steps.map(s => s.name).join(' → ') || '還沒有階段'}）` : '先在「生產線」新增一條生產線，再把需求送進工廠';
   if ($('#prompt').placeholder !== ph) $('#prompt').placeholder = ph;
-  const tasks = Object.values(S.tasks).reverse();
-  setHTML($('#tasks'), tasks.map(t => {
-    const live = ['running','waiting_user'].includes(t.status);
-    return `<div class="task"><b>${esc(t.title)}</b>
-     <span class="badge ${esc(t.status)}">${esc(TASK_STATUS[t.status]||t.status)}</span> ${t.stage ? '· '+esc(t.stage) : ''}
-     ${live ? `<button class="ghost" data-cancel="${esc(t.id)}">取消</button>` : ''}
-     ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
-     ${t.outputs.map(o => `<div class="out"><b>${esc(o.stage)} · ${esc(label(o.node))}</b>\n${esc(o.text)}</div>`).join('')}
-     ${live ? `<div class="out live" id="tl-${esc(t.id)}">${esc(taskLive.get(t.id)||'')}</div>` : ''}</div>`;
-  }).join(''));
+  const tasks = Object.values(S.tasks).sort((x, y) => y.created_at - x.created_at);
+  setHTML($('#tasks'), tasks.map(taskCard).join(''));
   renderAsks(tasks.filter(t => t.question));
   document.title = tasks.some(t => t.question) ? '❓ AI 需要你回答' : 'AI 工廠';
+}
+
+function taskMarkdown(t) {
+  const when = new Date(t.created_at * 1000).toLocaleString('zh-TW', { hour12: false });
+  let md = `# ${t.title}\n\n- 生產線：${t.pipeline?.name || ''}\n- 建立時間：${when}\n- 狀態：${TASK_STATUS[t.status] || t.status}\n\n## 任務內容\n\n${t.prompt}\n`;
+  for (const o of t.outputs) md += `\n## ${o.stage}（${label(o.node)}）\n\n${o.text}\n`;
+  if (t.error) md += `\n## 錯誤\n\n${t.error}\n`;
+  return md;
+}
+
+function downloadTask(t) {
+  const d = new Date(t.created_at * 1000), pad = n => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([taskMarkdown(t)], { type: 'text/markdown;charset=utf-8' }));
+  a.download = `${t.title.replace(/[\\/:*?"<>|\r\n]+/g, '_').slice(0, 60) || '任務'}-${stamp}.md`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
 // 提問區以任務 id 為鍵增量更新：其他事件觸發重繪時，不會清掉正在輸入的回答。
@@ -308,38 +347,59 @@ const EDITOR = {
 };
 
 // ---------- 生產線編輯 ----------
-let pipe = null;  // 編輯中的草稿
+let pipe = null;  // 編輯中的草稿：{ id（新增時是 null）, name, steps }
 const newStage = () => ({ name: '', node: Object.keys(S.nodes)[0] || '', template: '{input}' });
+
+function openPipe(id) {
+  const p = S.pipelines.find(x => x.id === id);
+  pipe = p ? { id: p.id, name: p.name, steps: p.steps.map(s => ({...s})) } : { id: null, name: '', steps: [newStage()] };
+  renderPipe();
+  render();
+  $('#pipe-editor').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
 
 function renderPipe() {
   const box = $('#pipe-editor');
-  $('#edit-pipe').hidden = !!pipe;
+  $('#new-pipe').hidden = !!pipe;
   if (!pipe) { box.hidden = true; box.innerHTML = ''; return; }
-  const nodes = Object.values(S.nodes);
-  for (const s of pipe) if (!S.nodes[s.node]) s.node = nodes[0]?.id || '';
-  box.innerHTML = `<div class="hint" style="margin:0 0 8px">指令裡的 <code>{input}</code> 會換成上一階段的輸出（第一階段是任務內容）。</div>` +
-    pipe.map((s, i) => `<div class="stage-row"><div class="top"><b>${i + 1}</b>
+  const nodes = Object.values(S.nodes), steps = pipe.steps;
+  for (const s of steps) if (!S.nodes[s.node]) s.node = nodes[0]?.id || '';
+  box.innerHTML = `<b>${pipe.id ? '編輯生產線' : '新增生產線'}</b>
+    <div class="row" style="margin-bottom:8px"><input data-pname value="${esc(pipe.name)}" maxlength="30" placeholder="生產線名稱，例如：遊戲企劃"></div>
+    <div class="hint" style="margin:0 0 8px">指令裡的 <code>{input}</code> 會換成上一階段的輸出（第一階段是任務內容），
+      <code>{task}</code> 會換成原始任務內容（例如讓「審查」對照原始需求）。</div>` +
+    steps.map((s, i) => `<div class="stage-row"><div class="top"><b>${i + 1}</b>
       <input data-i="${i}" data-f="name" value="${esc(s.name)}" maxlength="30" placeholder="階段名稱，例如：分析">
       <select data-i="${i}" data-f="node">${nodes.length ? nodes.map(n =>
         `<option value="${esc(n.id)}"${n.id === s.node ? ' selected' : ''}>${esc(n.label)}</option>`).join('') : '<option value="">（先新增 AI）</option>'}</select>
       <button class="ghost" data-p="up" data-i="${i}"${i ? '' : ' disabled'} title="上移">↑</button>
-      <button class="ghost" data-p="down" data-i="${i}"${i < pipe.length - 1 ? '' : ' disabled'} title="下移">↓</button>
+      <button class="ghost" data-p="down" data-i="${i}"${i < steps.length - 1 ? '' : ' disabled'} title="下移">↓</button>
       <button class="ghost" data-p="del" data-i="${i}" title="刪除這個階段">✕</button></div>
-      <textarea rows="3" data-i="${i}" data-f="template" placeholder="給這個 AI 的指令，要包含 {input}">${esc(s.template)}</textarea></div>`).join('') +
+      <textarea rows="3" data-i="${i}" data-f="template" placeholder="給這個 AI 的指令，要包含 {input} 或 {task}">${esc(s.template)}</textarea></div>`).join('') +
     `<button class="ghost" data-p="add">＋ 新增階段</button><div class="error" id="pe-err"></div>
-    <div class="actions"><button class="plain" data-p="cancel">取消</button><button data-p="save">儲存生產線</button></div>`;
+    <div class="actions">${pipe.id ? '<button class="danger" data-p="remove">刪除這條生產線</button>' : ''}
+      <button class="plain" data-p="cancel">取消</button><button data-p="save">儲存生產線</button></div>`;
   box.hidden = false;
 }
 
 const PIPE = {
-  add: () => pipe.push(newStage()),
-  del: i => pipe.splice(i, 1),
-  up: i => pipe.splice(i - 1, 0, ...pipe.splice(i, 1)),
-  down: i => pipe.splice(i + 1, 0, ...pipe.splice(i, 1)),
+  add: () => pipe.steps.push(newStage()),
+  del: i => pipe.steps.splice(i, 1),
+  up: i => pipe.steps.splice(i - 1, 0, ...pipe.steps.splice(i, 1)),
+  down: i => pipe.steps.splice(i + 1, 0, ...pipe.steps.splice(i, 1)),
   cancel: () => { pipe = null; },
   save: async () => {
-    const r = await api('/api/pipeline', { steps: pipe }, 'PUT');
-    if (r.ok) pipe = null; else { $('#pe-err').textContent = r.error; return false; }
+    const body = { name: pipe.name, steps: pipe.steps };
+    const r = pipe.id ? await api(`/api/pipelines/${pipe.id}`, body, 'PUT') : await api('/api/pipelines', body);
+    if (!r.ok) { $('#pe-err').textContent = r.error; return false; }
+    if (!pipe.id) $('#task-pipe').value = r.data.id;  // 新的生產線順便選起來
+    pipe = null;
+  },
+  remove: async () => {
+    if (!confirm(`刪除生產線「${pipe.name}」？進行中的任務會照原本的流程跑完。`)) return false;
+    const r = await api(`/api/pipelines/${pipe.id}`, null, 'DELETE');
+    if (!r.ok) { $('#pe-err').textContent = r.error; return false; }
+    pipe = null;
   },
 };
 
@@ -399,6 +459,15 @@ function syncTargets() {
   if (S.nodes[prev]) sel.value = prev;
 }
 
+function syncPipeSelect() {
+  const sel = $('#task-pipe'), prev = sel.value;
+  sel.innerHTML = S.pipelines.length ? S.pipelines.map(p =>
+    `<option value="${esc(p.id)}"${p.steps.length ? '' : ' disabled'}>${esc(p.name)}${p.steps.length ? '' : '（還沒有階段）'}</option>`).join('')
+    : '<option value="">（還沒有生產線）</option>';
+  const usable = S.pipelines.filter(p => p.steps.length);
+  sel.value = usable.some(p => p.id === prev) ? prev : (usable[0]?.id || '');
+}
+
 function log(text, cls='') { const l = $('#log'); l.insertAdjacentHTML('beforeend', `<div class="${cls}">${esc(text)}</div>`); l.scrollTop = l.scrollHeight; }
 function chatLine(who, cls, text) { const c = $('#chat'); c.insertAdjacentHTML('beforeend', `<div class="${cls}"><span class="src">${esc(who)}：</span><span></span></div>`); c.lastElementChild.lastElementChild.textContent = text; c.scrollTop = c.scrollHeight; return c.lastElementChild; }
 function bubbleFor(node) { if (!bubbles.has(node)) bubbles.set(node, chatLine(label(node), 'ai', '')); return bubbles.get(node).lastElementChild; }
@@ -406,10 +475,12 @@ function closeBubbles(note) { for (const b of bubbles.values()) if (note) b.last
 
 function applyConfig(ev) {
   S.nodes = Object.fromEntries(ev.nodes.map(n => [n.id, n]));
-  S.pipeline = ev.pipeline;
+  S.pipelines = ev.pipelines;
   syncTargets();
+  syncPipeSelect();
   if (editing?.id && !S.nodes[editing.id]) { editing = null; renderEditor(); }
-  if (pipe) renderPipe();
+  if (pipe?.id && !S.pipelines.some(p => p.id === pipe.id)) pipe = null;  // 被刪掉了
+  renderPipe();
 }
 
 function onEvent(ev) {
@@ -433,6 +504,7 @@ function onEvent(ev) {
       if (!old || old.stage !== ev.task.stage) taskLive.delete(ev.task.id);
       S.tasks[ev.task.id] = ev.task; break;
     }
+    case 'task_removed': delete S.tasks[ev.id]; taskLive.delete(ev.id); openTasks.delete(ev.id); break;
     case 'log': log(ev.text, ev.level === 'error' ? 'err' : ''); break;
     case 'ask': log(`❓ ${label(ev.node)} 提問：${ev.text}`, 'err'); try { new Notification('AI 需要你回答', {body: ev.text}); } catch {} break;
     case 'attempt':  // 新的一次呼叫：丟掉上一次（失敗或提問前）的半截輸出
@@ -492,7 +564,8 @@ async function once(btn, fn) {
 }
 $('#go').onclick = () => once($('#go'), async () => {
   const p = $('#prompt').value.trim(); if (!p) return;
-  if (await post('/api/tasks', {title: $('#title').value.trim(), prompt: p})) { $('#prompt').value = ''; $('#title').value = ''; }
+  const body = {title: $('#title').value.trim(), prompt: p, pipeline: $('#task-pipe').value || null};
+  if (await post('/api/tasks', body)) { $('#prompt').value = ''; $('#title').value = ''; }
 });
 const send = () => once($('#send'), async () => {
   const m = $('#msg').value.trim();
@@ -500,7 +573,7 @@ const send = () => once($('#send'), async () => {
 });
 $('#send').onclick = send; $('#msg').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) send(); };
 $('#add-node').onclick = () => openEditor(null);
-$('#edit-pipe').onclick = () => { pipe = S.pipeline.map(s => ({...s})); if (!pipe.length) pipe.push(newStage()); renderPipe(); };
+$('#new-pipe').onclick = () => openPipe(null);
 
 const ACCT = {
   refresh: () => post('/api/accounts/refresh'),
@@ -534,10 +607,14 @@ const ACCT = {
 document.addEventListener('click', e => {
   const t = e.target, d = t.dataset || {};
   if (d.cancel) post(`/api/tasks/${d.cancel}/cancel`);
+  else if (d.taskCopy) navigator.clipboard?.writeText(taskMarkdown(S.tasks[d.taskCopy])).then(() => log('已複製任務結果（Markdown）'), e => log(`複製失敗：${e.message}`, 'err'));
+  else if (d.taskSave) downloadTask(S.tasks[d.taskSave]);
+  else if (d.taskDel) { if (confirm(`刪除任務「${S.tasks[d.taskDel]?.title}」？`)) post(`/api/tasks/${d.taskDel}`, null, 'DELETE'); }
+  else if (d.pedit) openPipe(d.pedit);
   else if (d.edit) openEditor(d.edit);
   else if (d.acct && ACCT[d.acct]) once(t, () => ACCT[d.acct](d.id));
   else if (d.ne && EDITOR[d.ne]) once(t, EDITOR[d.ne]);
-  else if (d.p && PIPE[d.p]) once(t, async () => { if (await PIPE[d.p](Number(d.i)) !== false) renderPipe(); });
+  else if (d.p && PIPE[d.p]) once(t, async () => { if (await PIPE[d.p](Number(d.i)) !== false) { renderPipe(); render(); } });
 });
 document.addEventListener('keydown', e => {
   if (e.key !== 'Enter' || e.isComposing) return;
@@ -548,14 +625,21 @@ document.addEventListener('keydown', e => {
 });
 document.addEventListener('input', e => {
   const d = e.target.dataset || {};
-  if (pipe && d.f && $('#pipe-editor').contains(e.target)) pipe[Number(d.i)][d.f] = e.target.value;
+  if (!pipe || !$('#pipe-editor').contains(e.target)) return;
+  if (d.f) pipe.steps[Number(d.i)][d.f] = e.target.value;
+  else if ('pname' in d) pipe.name = e.target.value;
 });
+document.addEventListener('toggle', e => {  // 記住哪些任務的結果是展開的
+  const id = e.target.dataset?.task;
+  if (id) e.target.open ? openTasks.add(id) : openTasks.delete(id);
+}, true);
 document.addEventListener('change', e => {
   const t = e.target, d = t.dataset || {};
   if (d.model) post(`/api/nodes/${d.model}`, {model: t.value}, 'PATCH');  // 卡片上直接切換本地模型
   else if (t.name === 'kind' && editing) { editing.kind = t.value; neModels = { list: [], error: '' }; renderEditor({ ...editorValues(), model: '', account: '' }); if (t.value === 'ollama') loadModels(); }
   else if (t.name === 'host' && editing?.kind === 'ollama') loadModels();
-  else if (pipe && d.f && $('#pipe-editor').contains(t)) pipe[Number(d.i)][d.f] = t.value;
+  else if (pipe && d.f && $('#pipe-editor').contains(t)) pipe.steps[Number(d.i)][d.f] = t.value;
+  else if (t.id === 'task-pipe') render();
 });
 post('/api/accounts/refresh');  // 開頁時查一次登入狀態
 </script>

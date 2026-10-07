@@ -3,12 +3,15 @@
 - Claude、ChatGPT（Codex）：每個帳號一個獨立的 CLI 設定資料夾（CLAUDE_CONFIG_DIR / CODEX_HOME），
   用瀏覽器登入，登入資訊存在資料夾裡、互不影響。
 - Gemini、OpenAI 相容 API：帳號就是一把 API 金鑰。Gemini 帳號另有自己的 GEMINI_CLI_HOME。
-帳號清單存在 data/accounts.json（金鑰也在裡面，不會傳給瀏覽器）；設定資料夾在 data/accounts/<id>。
+帳號清單存在 data/accounts.json；設定資料夾在 data/accounts/<id>。
+API 金鑰在 Windows 上以 DPAPI 加密（只有同一個 Windows 帳號解得開），不會傳給瀏覽器。
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import ctypes
 import json
 import re
 import sys
@@ -36,6 +39,46 @@ OnUrl = Callable[[str], Awaitable[None]]
 
 async def _nothing(_: str) -> None:
     pass
+
+
+DPAPI_PREFIX = "dpapi:"
+
+
+class _Blob(ctypes.Structure):
+    _fields_ = [("cbData", ctypes.c_uint32), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Windows DPAPI（CryptProtectData / CryptUnprotectData），金鑰綁定目前的 Windows 使用者。"""
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    fn.argtypes = [ctypes.POINTER(_Blob), ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                   ctypes.c_uint32, ctypes.POINTER(_Blob)]
+    fn.restype = ctypes.c_int
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src, out = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), _Blob()
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):  # 0x1：不跳任何視窗
+        raise OSError(ctypes.get_last_error(), "DPAPI 失敗")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(ctypes.cast(out.pbData, ctypes.c_void_p))
+
+
+def protect_secret(secret: str) -> str:
+    if not secret or sys.platform != "win32":  # 非 Windows（開發 / 測試）沒有 DPAPI，維持原樣
+        return secret
+    return DPAPI_PREFIX + base64.b64encode(_dpapi(secret.encode("utf-8"), True)).decode("ascii")
+
+
+def reveal_secret(stored: str) -> str:
+    if not stored.startswith(DPAPI_PREFIX):
+        return stored  # 0.2.0 存的明文
+    if sys.platform != "win32":
+        raise ValueError("這把金鑰是在 Windows 上加密的")
+    return _dpapi(base64.b64decode(stored[len(DPAPI_PREFIX):]), False).decode("utf-8")
 
 
 def _login_error(output: str) -> str:
@@ -213,19 +256,29 @@ class Accounts:
         except (OSError, ValueError) as e:
             print(f"[accounts] {self.file} 讀取失敗，當作沒有帳號：{e}", file=sys.stderr)
             return
+        plaintext = False
         for a in raw.get("accounts", []):
             provider = a.get("provider") or "claude"  # 舊版只有 Claude 帳號
             aid = a.get("id")
             if not aid or provider not in PROVIDERS or (PROVIDERS[provider]["folder"] and not a.get("config_dir")):
                 continue
+            stored = a.get("key") or ""
+            try:
+                key = reveal_secret(stored)
+            except (OSError, ValueError, binascii.Error, UnicodeError):
+                key = ""
+                self.errors[aid] = "金鑰無法解密（可能是從別台電腦或別的 Windows 帳號複製過來的），請重新輸入"
+            plaintext = plaintext or bool(stored and stored == key)
             self.items[aid] = {"id": aid, "name": a.get("name") or aid, "provider": provider,
-                               "config_dir": a.get("config_dir") or "", "key": a.get("key") or ""}
+                               "config_dir": a.get("config_dir") or "", "key": key}
         # 舊版的「預設帳號」（沿用電腦上的 Claude 登入）已移除，分配到它的節點改成未指定。
         self.legacy_nodes = {n: a for n, a in raw.get("nodes", {}).items() if a in self.items}
+        if plaintext and sys.platform == "win32":  # 0.2.0 的明文金鑰改存成加密
+            self._save()
 
     def _save(self) -> None:
-        data = {"accounts": [{k: v for k, v in a.items() if v or k in ("id", "name", "provider")}
-                             for a in self.items.values()]}
+        data = {"accounts": [{k: (protect_secret(v) if k == "key" else v) for k, v in a.items()
+                              if v or k in ("id", "name", "provider")} for a in self.items.values()]}
         self.file.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
