@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import ipaddress
 import os
+import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
+from .connectors import ConnectorError, ollama_models
 from .factory import Factory
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -95,15 +97,77 @@ class AnswerIn(_In):
     text: str
 
 
+class AccountIn(_In):
+    name: str
+    provider: str = "claude"
+
+
+class CodeIn(_In):
+    code: str
+
+
+class KeyIn(_In):
+    key: str
+
+
+class NodeIn(_In):
+    kind: str
+    label: str
+    model: str = ""
+    role: str = ""
+    account: str | None = None
+    timeout: int | None = None
+    host: str = ""
+    base_url: str = ""
+
+
+class NodePatch(_In):  # 只改有送來的欄位
+    label: str | None = None
+    model: str | None = None
+    role: str | None = None
+    account: str | None = None
+    timeout: int | None = None
+    host: str | None = None
+    base_url: str | None = None
+
+
+class StageIn(_In):
+    name: str
+    node: str
+    template: str
+
+
+class PipelineIn(_In):
+    steps: list[StageIn]
+
+
+@contextlib.contextmanager
+def account_errors():
+    try:
+        yield
+    except KeyError as e:
+        raise HTTPException(404, "未知的帳號或節點") from e
+    except (ValueError, ConnectorError) as e:
+        raise HTTPException(409, str(e)) from e
+
+
 def create_app(
-    force_fake: bool | None = None, data_dir: Path | None = None, allowed_hosts: set[str] | None = None
+    force_fake: bool | None = None, data_dir: Path | None = None, allowed_hosts: set[str] | None = None,
+    config: Path | None = None,
 ) -> FastAPI:
     if force_fake is None:
         force_fake = os.environ.get("FACTORY_FAKE") == "1"
     if allowed_hosts is None:  # 例如要從區網其他電腦開：FACTORY_ALLOWED_HOSTS=192.168.1.10
         extra = os.environ.get("FACTORY_ALLOWED_HOSTS", "")
         allowed_hosts = set(DEFAULT_HOSTS) | {n for n in map(normalize_host, extra.split(",")) if n}
-    factory = Factory(ROOT / "nodes.json", data_dir or ROOT / "data", force_fake)
+    # 桌面版把設定與資料放在 %LOCALAPPDATA%\AIFactory（安裝資料夾可能不能寫），用環境變數指定。
+    data_dir = data_dir or Path(os.environ.get("FACTORY_DATA_DIR") or ROOT / "data")
+    # Dashboard 會把節點與生產線存回設定檔；預設放在資料夾裡，repo 的 nodes.json 只當全新安裝的起點。
+    config = config or Path(os.environ.get("FACTORY_CONFIG") or data_dir / "nodes.json")
+    if not config.exists():
+        config.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / "nodes.json", config)
+    factory = Factory(config, data_dir, force_fake)
 
     async def refresher() -> None:
         while True:
@@ -113,6 +177,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        await factory.accounts.refresh()
         await factory.refresh()
         loop_task = asyncio.create_task(refresher())
         yield
@@ -148,7 +213,8 @@ def create_app(
     async def create_task(body: TaskIn):
         if not body.prompt.strip():
             raise HTTPException(422, "任務內容是空的")
-        return factory.start_task(body.title.strip() or body.prompt[:20], body.prompt)
+        with account_errors():
+            return factory.start_task(body.title.strip() or body.prompt[:20], body.prompt)
 
     @app.post("/api/tasks/{task_id}/answer")
     async def answer(task_id: str, body: AnswerIn):
@@ -160,6 +226,93 @@ def create_app(
     async def cancel(task_id: str):
         if not factory.cancel(task_id):
             raise HTTPException(409, "此任務不在執行中")
+        return {"ok": True}
+
+    # ---------- 節點與生產線設定 ----------
+    @app.post("/api/nodes")
+    async def add_node(body: NodeIn):
+        with account_errors():
+            return await factory.add_node(body.model_dump())
+
+    @app.patch("/api/nodes/{nid}")
+    async def update_node(nid: str, body: NodePatch):
+        with account_errors():
+            return await factory.update_node(nid, body.model_dump(exclude_unset=True))
+
+    @app.delete("/api/nodes/{nid}")
+    async def remove_node(nid: str):
+        with account_errors():
+            await factory.remove_node(nid)
+        return {"ok": True}
+
+    @app.put("/api/pipeline")
+    async def set_pipeline(body: PipelineIn):
+        with account_errors():
+            return await factory.set_pipeline([s.model_dump() for s in body.steps])
+
+    @app.get("/api/ollama/models")
+    async def list_ollama_models(host: str = ""):
+        with account_errors():
+            return {"models": await asyncio.to_thread(ollama_models, host)}
+
+    # ---------- AI 帳號 ----------
+    @app.get("/api/accounts")
+    async def accounts():
+        await factory.accounts.refresh()
+        await factory.accounts_changed()
+        return factory.accounts.public()
+
+    @app.post("/api/accounts/refresh")
+    async def refresh_accounts():
+        await factory.accounts.refresh()
+        await factory.accounts_changed()
+        return {"ok": True}
+
+    @app.post("/api/accounts")
+    async def add_account(body: AccountIn):
+        with account_errors():
+            a = factory.accounts.add(body.name, body.provider)
+        await factory.accounts_changed()
+        return a
+
+    @app.post("/api/accounts/{aid}/key")
+    async def set_key(aid: str, body: KeyIn):
+        with account_errors():
+            factory.accounts.set_key(aid, body.key)
+        await factory.accounts_changed()
+        return {"ok": True}
+
+    @app.post("/api/accounts/{aid}/login")
+    async def login(aid: str):
+        with account_errors():
+            factory.accounts.start_login(aid)
+        await factory.accounts_changed()
+        return {"ok": True}
+
+    @app.post("/api/accounts/{aid}/code")
+    async def login_code(aid: str, body: CodeIn):
+        with account_errors():
+            factory.accounts.submit_code(aid, body.code)
+        return {"ok": True}
+
+    @app.post("/api/accounts/{aid}/cancel")
+    async def cancel_login(aid: str):
+        with account_errors():
+            await factory.accounts.cancel_login(aid)
+        await factory.accounts_changed()
+        return {"ok": True}
+
+    @app.post("/api/accounts/{aid}/logout")
+    async def logout(aid: str):
+        with account_errors():
+            await factory.accounts.logout(aid)
+        await factory.accounts_changed()
+        return {"ok": True}
+
+    @app.delete("/api/accounts/{aid}")
+    async def remove_account(aid: str):
+        with account_errors():
+            await factory.remove_account(aid)
         return {"ok": True}
 
     @app.websocket("/ws")

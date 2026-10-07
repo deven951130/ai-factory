@@ -1,6 +1,6 @@
-"""AI 連接器：CLI（Claude / Gemini）與 HTTP（Ollama）。
+"""AI 連接器：CLI（Claude / ChatGPT Codex / Gemini）與 HTTP（Ollama / OpenAI 相容 API）。
 
-全部走「訂閱 CLI / 本地服務」，不操作網頁 DOM，不需要 API 金鑰。
+不操作網頁 DOM。登入資訊由帳號提供（extra 裡的設定資料夾或金鑰），不沿用電腦上 CLI 自己的登入。
 每個連接器只做一件事：run(prompt, on_chunk) -> 完整回覆文字。
 """
 from __future__ import annotations
@@ -11,10 +11,13 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,7 +31,21 @@ CLAUDE_DISALLOWED = (
 )
 # 子程序不繼承這些變數，避免 claude -p 改走按量計費的 API 金鑰而不是訂閱。
 CLAUDE_API_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+CODEX_API_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY")
+# Gemini CLI 會從這些變數決定登入方式；用帳號的金鑰時全部拿掉，不沿用電腦上的設定。
+GEMINI_AUTH_ENV = (
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI",
+    "GOOGLE_GEMINI_BASE_URL", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "CLOUD_SHELL",
+    "GEMINI_CLI_USE_COMPUTE_ADC",
+)
+# Codex 是會自己執行指令的 agent；這裡只做文字生成，把能動到電腦或網路的工具都關掉。
+CODEX_OFF = ("shell_tool", "unified_exec", "apps", "plugins", "browser_use", "computer_use",
+             "multi_agent", "image_generation")
+# 憑證存在帳號的 CODEX_HOME 資料夾（不放系統金鑰圈）：各帳號互不影響，解除安裝時能一起清掉。
+CODEX_FILE_AUTH = ("--disable", "secret_auth_storage")
 DEFAULT_TIMEOUT = 300.0
+# 桌面版沒有主控台：不加這個旗標，每次呼叫 claude.cmd / gemini.cmd 都會閃出一個黑色視窗。
+NO_WINDOW: dict = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
 
 class ConnectorError(RuntimeError):
@@ -59,6 +76,11 @@ class Connector:
     timeout: float = DEFAULT_TIMEOUT
     workdir: Path | None = None  # CLI 的工作目錄：空資料夾，不讓 AI 讀到本專案
     extra: dict = field(default_factory=dict)
+    models: tuple[str, ...] = ()  # 偵測到可用的模型（本地模型 / OpenAI 相容 API）
+
+    def configure(self, extra: dict) -> None:
+        """換帳號或設定時呼叫：更新 extra 並丟掉依賴舊設定的快取。"""
+        self.extra = extra
 
     def available(self) -> tuple[bool, str]:
         raise NotImplementedError
@@ -90,7 +112,7 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
             try:
                 k = await asyncio.create_subprocess_exec(
                     "taskkill", "/T", "/F", "/PID", str(proc.pid),
-                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL, **NO_WINDOW,
                 )
                 await asyncio.wait_for(k.wait(), 10)
             except Exception:
@@ -114,7 +136,7 @@ async def run_subprocess(
     cwd: Path | None = None,
 ) -> tuple[int, str, str]:
     """執行子程序並串流 stdout。回傳 (exit code, stdout, stderr)。"""
-    kwargs: dict = {}
+    kwargs: dict = dict(NO_WINDOW)
     if sys.platform != "win32":
         kwargs["start_new_session"] = True  # 讓 _kill_tree 能用 killpg 砍整組
     try:
@@ -174,6 +196,28 @@ async def run_subprocess(
     return code, out, err_b.decode("utf-8", errors="replace")
 
 
+def claude_env(config_dir: str = "", use_api_key: bool = False) -> dict:
+    """claude 子程序的環境變數。config_dir：帳號的設定資料夾（空字串 = 預設帳號）。"""
+    env = dict(os.environ)
+    if not use_api_key:
+        for k in CLAUDE_API_ENV:
+            env.pop(k, None)
+    if config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+    return env
+
+
+def codex_env(codex_home: str = "") -> dict:
+    """codex 子程序的環境變數。codex_home：帳號的設定資料夾（登入資訊存在裡面）。"""
+    env = dict(os.environ)
+    for k in CODEX_API_ENV:
+        env.pop(k, None)
+    if codex_home:
+        env["CODEX_HOME"] = codex_home
+    env["NO_COLOR"] = "1"
+    return env
+
+
 def _fail_detail(code: int, out: str, err: str) -> str:
     # 有些 CLI（例如 claude）把錯誤印在 stdout，stderr 是空的。
     detail = err.strip() or out.strip() or "（沒有輸出）"
@@ -181,16 +225,22 @@ def _fail_detail(code: int, out: str, err: str) -> str:
 
 
 class ClaudeConnector(Connector):
+    def _config_dir(self) -> str:
+        # 多帳號：每個帳號一個 Claude 設定資料夾（登入資訊存在裡面），以 CLAUDE_CONFIG_DIR 指定。
+        d = self.extra.get("config_dir") or ""
+        return os.path.normpath(os.path.expanduser(os.path.expandvars(d))) if d else ""
+
     def available(self):
         exe = _which("claude")
-        return (bool(exe), exe or "未安裝 claude CLI")
+        if not exe:
+            return (False, "未安裝 claude CLI")
+        cfg = self._config_dir()
+        if cfg and not os.path.isdir(cfg):
+            return (False, f"找不到 config_dir：{cfg}")
+        return (True, exe)
 
     def _env(self) -> dict:
-        env = dict(os.environ)
-        if not self.extra.get("use_api_key"):
-            for k in CLAUDE_API_ENV:
-                env.pop(k, None)
-        return env
+        return claude_env(self._config_dir(), bool(self.extra.get("use_api_key")))
 
     async def run(self, prompt, on_chunk):
         exe = _which("claude") or "claude"
@@ -254,10 +304,16 @@ class ClaudeConnector(Connector):
 class GeminiConnector(Connector):
     def available(self):
         exe = _which("gemini")
-        return (bool(exe), exe or "未安裝 gemini CLI")
+        return (bool(exe), exe or "未安裝 gemini CLI（npm install -g @google/gemini-cli）")
 
     def _env(self) -> dict:
         env = dict(os.environ)
+        if self.extra.get("api_key"):
+            for k in GEMINI_AUTH_ENV:
+                env.pop(k, None)
+            env["GEMINI_API_KEY"] = self.extra["api_key"]
+        if self.extra.get("home"):  # 帳號自己的 ~/.gemini（設定、信任資料夾、暫存），不讀電腦上的
+            env["GEMINI_CLI_HOME"] = self.extra["home"]
         env.update(
             # 新版 Gemini CLI 在未信任的資料夾拒絕無頭執行（exit 55）。
             GEMINI_CLI_TRUST_WORKSPACE="true",
@@ -277,8 +333,74 @@ class GeminiConnector(Connector):
         return out.strip()
 
 
+class CodexConnector(Connector):
+    """ChatGPT 訂閱：Codex CLI 的 codex exec（非互動），以 --json 讀事件。"""
+
+    def available(self):
+        exe = _which("codex")
+        return (bool(exe), exe or "未安裝 codex CLI（npm install -g @openai/codex）")
+
+    async def run(self, prompt, on_chunk):
+        exe = _which("codex") or "codex"
+        cmd = [exe, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "--sandbox", "read-only",
+               "--color", "never", "--ignore-rules", *CODEX_FILE_AUTH]
+        for feature in CODEX_OFF:
+            cmd += ["--disable", feature]
+        if self.model:
+            cmd += ["-m", self.model]
+        cmd.append("-")  # prompt 走 stdin
+        buf = ""
+        messages: list[str] = []
+        failed = ""
+        last_error = ""
+
+        async def on_text(text: str) -> None:
+            nonlocal buf, failed, last_error
+            buf += text
+            *lines, buf = buf.split("\n")
+            for line in lines:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                kind = ev.get("type")
+                if kind == "item.completed":
+                    item = ev.get("item") or {}
+                    if item.get("type") == "agent_message" and item.get("text"):
+                        if messages:
+                            await on_chunk("\n\n")
+                        messages.append(item["text"])
+                        await on_chunk(item["text"])
+                elif kind == "turn.failed":
+                    failed = str((ev.get("error") or {}).get("message") or "turn.failed")
+                elif kind == "error":  # 也用來報「重新連線中」，不一定是最終失敗
+                    last_error = str(ev.get("message") or "")
+
+        code, out, err = await run_subprocess(cmd, prompt, on_text, self.timeout, codex_env(self.extra.get("codex_home", "")),
+                                              self.workdir)
+        if buf.strip():
+            await on_text("\n")
+        if failed:  # Codex 內部已重試過（例如額度用完）
+            raise ConnectorError(failed[-300:], retryable=False)
+        if messages:
+            return "\n\n".join(messages).strip()
+        raise ConnectorError(last_error[-300:] if last_error else _fail_detail(code, "", err))
+
+
 def _ollama_name(name: str) -> str:
     return name if ":" in name else f"{name}:latest"
+
+
+def ollama_models(host: str = "") -> list[str]:
+    """已安裝、可對話的模型（略過 embedding 模型）。Ollama 沒開時丟 ConnectorError。"""
+    base = ollama_base(host or os.environ.get("OLLAMA_HOST", ""))
+    try:
+        # trust_env=False：Windows 系統 proxy 不會略過 127.0.0.1，本機請求會被送去 proxy。
+        r = httpx.get(f"{base}/api/tags", timeout=1.5, trust_env=False)
+        names = [m["name"] for m in r.json().get("models", [])]
+    except Exception as e:
+        raise ConnectorError(f"Ollama 未啟動（{base}）") from e
+    return [n for n in names if "embed" not in n.lower()]
 
 
 class OllamaConnector(Connector):
@@ -286,22 +408,21 @@ class OllamaConnector(Connector):
 
     @property
     def base(self) -> str:
-        return ollama_base(os.environ.get("OLLAMA_HOST", ""))
+        return ollama_base(self.extra.get("host") or os.environ.get("OLLAMA_HOST", ""))
 
     def pick_model(self, installed: list[str]) -> str | None:
-        """設定的模型有裝就用它；沒裝就退而用第一個非 embedding 的已安裝模型。"""
+        """設定的模型有裝就用它；沒裝就退而用第一個已安裝的對話模型。"""
         if self.model and _ollama_name(self.model) in installed:
             return _ollama_name(self.model)
-        chat = [n for n in installed if "embed" not in n.lower()]
-        return chat[0] if chat else None
+        return installed[0] if installed else None
 
     def available(self):
         try:
-            # trust_env=False：Windows 系統 proxy 不會略過 127.0.0.1，本機請求會被送去 proxy。
-            r = httpx.get(f"{self.base}/api/tags", timeout=1.5, trust_env=False)
-            installed = [m["name"] for m in r.json().get("models", [])]
-        except Exception:
+            installed = ollama_models(self.base)
+        except ConnectorError:
+            self.models = ()
             return (False, "Ollama 未啟動")
+        self.models = tuple(installed)
         picked = self.pick_model(installed)
         if not picked:
             return (False, "Ollama 已啟動但沒有可對話的模型（ollama pull <model>）")
@@ -352,6 +473,101 @@ class OllamaConnector(Connector):
         return "".join(parts).strip()
 
 
+def _api_error(status: int, raw: str) -> str:
+    try:
+        err = json.loads(raw).get("error", raw)
+        raw = err.get("message", err) if isinstance(err, dict) else err
+    except (ValueError, AttributeError):
+        pass
+    return f"HTTP {status}: {str(raw)[:300]}"
+
+
+class OpenAIConnector(Connector):
+    """OpenAI 相容的 Chat Completions API（OpenAI、DeepSeek、xAI、OpenRouter、LM Studio…）。"""
+
+    CHECK_EVERY = 60.0  # 秒；遠端 API 不必每 15 秒都查一次 /models
+    _checked: tuple[float, tuple[bool, str]] | None = None
+
+    def configure(self, extra: dict) -> None:
+        self.extra = extra
+        self._checked = None
+
+    @property
+    def base(self) -> str:
+        return (self.extra.get("base_url") or "").rstrip("/")
+
+    def _client_kwargs(self) -> dict:
+        # 本機伺服器不能走系統 proxy；遠端 API 則可能需要 proxy。
+        local = urlsplit(self.base).hostname in ("localhost", "127.0.0.1", "::1")
+        key = self.extra.get("api_key")
+        return {"trust_env": not local, "headers": {"Authorization": f"Bearer {key}"} if key else {}}
+
+    def available(self):
+        if not self.base:
+            return (False, "沒有設定 API 網址")
+        now = time.monotonic()
+        if self._checked and now - self._checked[0] < self.CHECK_EVERY:
+            return self._checked[1]
+        try:
+            r = httpx.get(f"{self.base}/models", timeout=5, **self._client_kwargs())
+        except httpx.HTTPError as e:
+            result = (False, f"無法連線：{e}")
+        else:
+            if r.status_code in (401, 403):
+                result = (False, "API 金鑰無效或沒有權限")
+            else:  # 有些服務沒有 /models，仍可呼叫
+                try:
+                    self.models = tuple(m["id"] for m in r.json().get("data", []) if m.get("id"))
+                except (ValueError, AttributeError, TypeError):
+                    pass
+                result = (True, f"{self.base} · {self.model}")
+        self._checked = (now, result)
+        return result
+
+    async def run(self, prompt, on_chunk):
+        body = {"model": self.model, "messages": [{"role": "user", "content": prompt}], "stream": True}
+        parts: list[str] = []
+
+        async def stream() -> None:
+            finished = False
+            async with httpx.AsyncClient(timeout=self.timeout, **self._client_kwargs()) as c:
+                async with c.stream("POST", f"{self.base}/chat/completions", json=body) as r:
+                    if r.status_code != 200:
+                        raw = (await r.aread()).decode("utf-8", errors="replace")
+                        # 4xx（金鑰、模型名稱、額度）重試也一樣；5xx 才值得再試。
+                        raise ConnectorError(_api_error(r.status_code, raw), retryable=r.status_code >= 500)
+                    async for line in r.aiter_lines():
+                        line = line.strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            finished = True
+                            break
+                        obj = json.loads(data)
+                        if obj.get("error"):
+                            raise ConnectorError(_api_error(200, json.dumps(obj)))
+                        for choice in obj.get("choices") or []:
+                            piece = (choice.get("delta") or {}).get("content") or ""
+                            if piece:
+                                parts.append(piece)
+                                await on_chunk(piece)
+                            if choice.get("finish_reason"):
+                                finished = True
+            if not finished:
+                raise ConnectorError("API 串流在完成前中斷")
+
+        try:
+            await asyncio.wait_for(stream(), self.timeout)
+        except asyncio.TimeoutError as e:
+            raise ConnectorError(f"逾時（{self.timeout:.0f}s）", retryable=False) from e
+        except httpx.HTTPError as e:
+            raise ConnectorError(f"API 連線失敗：{e}") from e
+        except ValueError as e:
+            raise ConnectorError(f"API 回應格式錯誤：{e}") from e
+        return "".join(parts).strip()
+
+
 class FakeConnector(Connector):
     """示範 / 測試用。FACTORY_FAKE=1 時取代全部真實連接器。"""
 
@@ -367,7 +583,8 @@ class FakeConnector(Connector):
         return reply
 
 
-KINDS = {"claude": ClaudeConnector, "gemini": GeminiConnector, "ollama": OllamaConnector, "fake": FakeConnector}
+KINDS = {"claude": ClaudeConnector, "codex": CodexConnector, "gemini": GeminiConnector, "ollama": OllamaConnector,
+         "openai": OpenAIConnector, "fake": FakeConnector}
 
 
 def build(spec: dict, force_fake: bool = False, workdir: Path | None = None) -> Connector:
