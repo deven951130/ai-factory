@@ -1119,3 +1119,22 @@ def test_ollama_base_normalizes_host():
     assert ollama_base("0.0.0.0") == "http://127.0.0.1:11434"
     assert ollama_base("127.0.0.1:9999") == "http://127.0.0.1:9999"
     assert ollama_base("http://box:11434/") == "http://box:11434"
+
+
+GEMINI_STDERR = (
+    'Error generating content via API. _ApiError: {"error":{"code":400,"message":"API key not valid. '
+    'Please pass a valid API key.","status":"INVALID_ARGUMENT"}}\n'
+    '    at throwErrorIfNotOK (file:///x/chunk.js:1:1)\n'
+    'Error when talking to Gemini API _ApiError: {"error":{"message":"{\n  \\"error\\": {}}","code":400}}\n'
+    'An unexpected critical error occurred:[object Object]\n'
+)
+
+
+def test_gemini_api_error_is_readable(tmp_path, monkeypatch):
+    body = f"import sys\nsys.stdin.read()\nsys.stderr.write({GEMINI_STDERR!r})\nsys.exit(1)\n"
+    d = fake_cli_any_os(tmp_path, body, "gemini")
+    monkeypatch.setenv("PATH", f"{d}{os.pathsep}{os.environ['PATH']}")
+    g = GeminiConnector(id="g", label="G", kind="gemini", workdir=tmp_path)
+    with pytest.raises(ConnectorError) as e:
+        asyncio.run(g.run("hi", nothing))
+    assert str(e.value) == "Gemini API 400：API key not valid. Please pass a valid API key." and not e.value.retryable

@@ -9,6 +9,7 @@ import asyncio
 import codecs
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -301,6 +302,22 @@ class ClaudeConnector(Connector):
         return "".join(streamed).strip()
 
 
+GEMINI_API_ERROR_RE = re.compile(r'"code":\s*(\d{3}),\s*"message":\s*"((?:[^"\\]|\\.)*)"')
+
+
+def gemini_error(err: str) -> tuple[str, bool] | None:
+    """從 Gemini CLI 的堆疊輸出裡找出 API 回的錯誤（例如金鑰無效）。回傳 (訊息, 值不值得重試)。"""
+    for m in GEMINI_API_ERROR_RE.finditer(err):
+        try:
+            msg = json.loads(f'"{m.group(2)}"')
+        except ValueError:
+            msg = m.group(2)
+        if msg.strip() and not msg.lstrip().startswith("{"):  # 跳過包了一層 JSON 的重複訊息
+            code = int(m.group(1))
+            return f"Gemini API {code}：{msg.strip()[:300]}", code >= 500
+    return None
+
+
 class GeminiConnector(Connector):
     def available(self):
         exe = _which("gemini")
@@ -329,6 +346,8 @@ class GeminiConnector(Connector):
         cmd = [exe, "-m", self.model] if self.model else [exe]
         code, out, err = await run_subprocess(cmd, prompt, on_chunk, self.timeout, self._env(), self.workdir)
         if code != 0:
+            if api := gemini_error(err):  # 金鑰無效、額度用完這類 4xx 重試也一樣
+                raise ConnectorError(api[0], retryable=api[1])
             raise ConnectorError(_fail_detail(code, out, err))
         return out.strip()
 

@@ -104,4 +104,4 @@ Dashboard 上新增 / 修改的 AI 節點與生產線都會存回這個檔案。
 - 任務只做文字生成（Claude / Codex 的工具已停用）；尚無寫檔 / 跑測試 / git worktree 沙箱。
 - 節點狀態只存在記憶體；重開時重新偵測。
 - Gemini 只支援 API 金鑰：Gemini CLI 在非互動模式下不能用 Google 帳號手動登入。
-- 實機驗證過：Claude 帳號登入狀態查詢、Ollama 模型清單與切換、全新安裝流程（模擬模式）。ChatGPT（Codex）以假 CLI、OpenAI 相容 API 以測試伺服器、Gemini 金鑰以環境變數檢查驗證，尚未用真實帳號跑過。
+- 實機驗證過（Windows）：Claude（真實帳號回覆）、本地 Ollama 回覆與模型切換、OpenAI 相容 API（接 Ollama 的 `/v1`）、Gemini CLI 用帳號自己的設定資料夾與金鑰送出請求（以無效金鑰確認錯誤訊息）、Codex CLI 的登入狀態判斷。ChatGPT（Codex）實際對話與 Gemini 實際回覆需要真實帳號 / 金鑰，尚未跑過。
