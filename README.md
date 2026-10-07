@@ -23,6 +23,8 @@ FACTORY_FAKE=1 python -m uvicorn backend.main:app   # 全部節點改為模擬�
 python -m pytest -q                                  # 測試
 ```
 
+> 不要加 `--reload`：Windows 上 uvicorn 的 reload 模式改用 SelectorEventLoop，無法啟動 CLI 子程序。
+
 節點與生產線在 `nodes.json` 設定（改 model、增減節點、調整階段與 prompt 模板）。
 
 ## 功能
@@ -39,4 +41,5 @@ python -m pytest -q                                  # 測試
 - 目前只有 Web 介面；桌面殼（Electron）與安裝檔尚未做。
 - 任務只做文字生成（Claude 工具已停用）；尚無寫檔 / 跑測試 / git worktree 沙箱。
 - 任務與節點狀態僅存記憶體，重啟後不還原（僅事件 log 持久化）。
-- Gemini CLI、Ollama 在 CI/雲端環境未實測，僅在 Claude CLI 做過真實呼叫。
+- Gemini CLI、Ollama 尚未在實機驗證（雲端環境沒有安裝），只有 Claude CLI 做過真實呼叫。
+- Ollama：`nodes.json` 指定的模型沒安裝時，會自動改用第一個已安裝的模型；`OLLAMA_HOST` 可為 `0.0.0.0`、`host:port` 或完整 URL。

@@ -86,8 +86,8 @@ class Factory:
                     out = await conn.run(prompt, chunk)
                     await self._set(nid, "idle", "完成", None)
                     return out
-                except ConnectorError as e:
-                    last_err = str(e)
+                except Exception as e:  # 非預期錯誤也要轉成節點失敗，不能讓任務卡在 running
+                    last_err = str(e) if isinstance(e, ConnectorError) else f"{type(e).__name__}: {e}"
                     await self.emit({"type": "log", "level": "error", "node": nid, "task_id": task_id,
                                      "text": f"{nid} 失敗（{attempt + 1}/{MAX_RETRY + 1}）：{last_err}"})
                     await asyncio.sleep(0.2 * (attempt + 1))

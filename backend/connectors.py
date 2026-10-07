@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import os
 import shutil
@@ -24,6 +25,19 @@ class ConnectorError(RuntimeError):
     pass
 
 
+def ollama_base(host: str) -> str:
+    """OLLAMA_HOST 也是 Ollama 伺服器自己的綁定設定，常見 "0.0.0.0" 或 "127.0.0.1:11434"（無 scheme）。"""
+    host = (host or "").strip().rstrip("/") or "127.0.0.1:11434"
+    if "://" not in host:
+        host = "http://" + host
+    scheme, rest = host.split("://", 1)
+    if rest.startswith("0.0.0.0"):
+        rest = "127.0.0.1" + rest[len("0.0.0.0"):]
+    if ":" not in rest.split("/")[0]:
+        rest = rest + ":11434"
+    return f"{scheme}://{rest}"
+
+
 @dataclass
 class Connector:
     id: str
@@ -39,6 +53,12 @@ class Connector:
         raise NotImplementedError
 
 
+def _which(name: str) -> str | None:
+    # Windows 上 npm 安裝的 CLI 是 claude.cmd / gemini.cmd；
+    # create_subprocess_exec 不會套 PATHEXT，所以一律先解析成完整路徑。
+    return shutil.which(name)
+
+
 async def _stream_subprocess(cmd: list[str], stdin_text: str, on_chunk: OnChunk, timeout: float) -> str:
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -49,62 +69,77 @@ async def _stream_subprocess(cmd: list[str], stdin_text: str, on_chunk: OnChunk,
         )
     except FileNotFoundError as e:
         raise ConnectorError(f"找不到執行檔：{cmd[0]}") from e
+    except NotImplementedError as e:  # Windows + SelectorEventLoop（例如 uvicorn --reload）
+        raise ConnectorError("目前事件迴圈不支援子程序；請勿用 --reload 啟動") from e
 
     async def feed() -> None:
         assert proc.stdin
-        proc.stdin.write(stdin_text.encode("utf-8"))
-        await proc.stdin.drain()
-        proc.stdin.close()
+        try:
+            proc.stdin.write(stdin_text.encode("utf-8"))
+            await proc.stdin.drain()
+            proc.stdin.close()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # 子程序提早結束；結束碼與 stderr 會說明原因
 
-    async def read() -> str:
+    async def read_out() -> str:
         assert proc.stdout
+        # 增量解碼：中文字 3 bytes，固定長度切塊會把字切成兩半。
+        dec = codecs.getincrementaldecoder("utf-8")(errors="replace")
         parts: list[str] = []
         while True:
             chunk = await proc.stdout.read(256)
+            text = dec.decode(chunk, final=not chunk)
+            if text:
+                parts.append(text)
+                await on_chunk(text)
             if not chunk:
                 break
-            text = chunk.decode("utf-8", errors="replace")
-            parts.append(text)
-            await on_chunk(text)
         return "".join(parts)
 
+    async def read_err() -> bytes:
+        # 必須同時讀 stderr，否則輸出量大時管線塞滿、子程序卡死。
+        assert proc.stderr
+        return await proc.stderr.read()
+
     try:
-        _, out = await asyncio.wait_for(asyncio.gather(feed(), read()), timeout)
+        _, out, err_b = await asyncio.wait_for(asyncio.gather(feed(), read_out(), read_err()), timeout)
         code = await proc.wait()
     except asyncio.TimeoutError as e:
         proc.kill()
         raise ConnectorError(f"逾時（{timeout:.0f}s）") from e
     if code != 0:
-        err = (await proc.stderr.read()).decode("utf-8", errors="replace").strip() if proc.stderr else ""
-        hint = "（可能尚未登入或用量已滿）" if err else ""
-        raise ConnectorError(f"exit {code}{hint}: {err[:300]}")
+        err = err_b.decode("utf-8", errors="replace").strip()
+        raise ConnectorError(f"exit {code}（可能尚未登入或用量已滿）: {err[-300:]}")
     return out.strip()
 
 
 class ClaudeConnector(Connector):
     def available(self):
-        exe = shutil.which("claude")
+        exe = _which("claude")
         return (bool(exe), exe or "未安裝 claude CLI")
 
     async def run(self, prompt, on_chunk, timeout=300):
-        cmd = ["claude", "-p", "--model", self.model or "sonnet", "--disallowed-tools", *CLAUDE_DISALLOWED.split()]
+        exe = _which("claude") or "claude"
+        cmd = [exe, "-p", "--model", self.model or "sonnet", "--disallowed-tools", *CLAUDE_DISALLOWED.split()]
         return await _stream_subprocess(cmd, prompt, on_chunk, timeout)
 
 
 class GeminiConnector(Connector):
     def available(self):
-        exe = shutil.which("gemini")
+        exe = _which("gemini")
         return (bool(exe), exe or "未安裝 gemini CLI")
 
     async def run(self, prompt, on_chunk, timeout=300):
-        cmd = ["gemini", "-p", prompt] if not self.model else ["gemini", "-m", self.model, "-p", prompt]
-        return await _stream_subprocess(cmd, "", on_chunk, timeout)
+        # prompt 走 stdin（非 TTY → 非互動模式）；Windows 的 .cmd 會吃掉參數裡的換行與特殊字元。
+        exe = _which("gemini") or "gemini"
+        cmd = [exe, "-m", self.model] if self.model else [exe]
+        return await _stream_subprocess(cmd, prompt, on_chunk, timeout)
 
 
 class OllamaConnector(Connector):
     @property
     def base(self) -> str:
-        return os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+        return ollama_base(os.environ.get("OLLAMA_HOST", ""))
 
     def available(self):
         try:

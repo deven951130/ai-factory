@@ -80,3 +80,42 @@ def test_api_chat_and_state(tmp_path):
                     seen.add(ev["role"])
         assert c.post("/api/chat", json={"node": "nope", "message": "x"}).status_code == 404
         assert c.post("/api/tasks/zzz/answer", json={"text": "x"}).status_code == 409
+
+
+def test_ollama_base_normalizes_host():
+    from backend.connectors import ollama_base
+    assert ollama_base("") == "http://127.0.0.1:11434"
+    assert ollama_base("0.0.0.0") == "http://127.0.0.1:11434"
+    assert ollama_base("127.0.0.1:9999") == "http://127.0.0.1:9999"
+    assert ollama_base("http://box:11434/") == "http://box:11434"
+
+
+def test_subprocess_stream_keeps_multibyte_chars(tmp_path):
+    import sys
+    from backend.connectors import _stream_subprocess
+    text = "中文串流測試" * 200  # 遠超過 256 bytes，必定跨塊
+    script = tmp_path / "emit.py"
+    script.write_text(
+        "import sys\nsys.stdout.buffer.write(sys.stdin.buffer.read())\nsys.stderr.write('x' * 200000)\n",
+        encoding="utf-8",
+    )
+    chunks = []
+
+    async def on_chunk(t):
+        chunks.append(t)
+    out = asyncio.run(_stream_subprocess([sys.executable, str(script)], text, on_chunk, 30))
+    assert out == text and "".join(chunks) == text and "�" not in out
+
+
+def test_unexpected_exception_blocks_task(tmp_path):
+    async def go():
+        f = make(tmp_path)
+
+        async def weird(prompt, on_chunk, timeout=300):
+            raise ValueError("bad json")
+        f.connectors["gemini"].run = weird
+        t = f.create_task("t", "x")
+        await f.run_task(t["id"])
+        return t
+    t = asyncio.run(go())
+    assert t["status"] == "blocked" and "ValueError" in t["error"]
