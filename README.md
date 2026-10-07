@@ -29,17 +29,27 @@ python -m pytest -q                                  # 測試
 
 ## 功能
 
-- 節點卡片：閒置 / 執行中 / 等你回答 / 失敗 / 離線（啟動時自動偵測 CLI 與 Ollama）
-- 生產線：預設 分析(Gemini) → 實作(Claude Sonnet) → 審查(Claude Opus)，逐階段傳遞輸出
-- 隨時發問：對話面板選任一節點，回覆即時串流
-- AI 提問：階段回覆含 `[[ASK_USER: 問題]]` → 任務暫停、節點轉橘色、瀏覽器通知，你回答後續跑
-- 失敗處理：每次呼叫最多重試 2 次，仍失敗任務進 `blocked`；同一節點同時只跑一件
+- 節點卡片：閒置 / 執行中 / 等你回答 / 失敗 / 離線。每 15 秒重新偵測，Ollama 晚啟動也會自動變可用
+- 生產線：預設 分析(Gemini) → 實作(Claude Sonnet) → 審查(Claude Opus)，逐階段傳遞輸出，任務卡片即時顯示 AI 正在寫的內容
+- 隨時發問：對話面板選任一節點，回覆逐字串流；可同時問多個 AI
+- AI 提問：階段回覆含 `[[ASK_USER: 問題]]` → 任務暫停、節點轉橘色、瀏覽器通知，你回答後續跑（每階段最多問 3 次）
+- 取消：進行中或等待回答的任務可隨時取消，CLI 子程序連同子孫程序一起結束
+- 失敗處理：失敗最多重試 2 次；逾時、Claude 回報的錯誤不重試；仍失敗任務進「已阻擋」並顯示原因
 - 事件紀錄：`data/events.jsonl`
+
+## 各 AI 的前提
+
+| 節點 | 需要 | 備註 |
+|---|---|---|
+| Claude | `claude` CLI 已登入（`claude` 跑一次完成登入） | 走訂閱額度。子程序會移除 `ANTHROPIC_API_KEY`，避免改走按量計費；要用 API 金鑰時在該節點加 `"extra": {"use_api_key": true}` |
+| Gemini | `gemini` CLI 已登入（`gemini` 跑一次完成 Google 登入） | 自動設定 `GEMINI_CLI_TRUST_WORKSPACE`，不需要手動信任資料夾 |
+| Ollama | Ollama 已啟動且至少 pull 一個對話模型 | `nodes.json` 指定的模型沒裝時，自動改用已安裝的對話模型（略過 embedding 模型）。`OLLAMA_HOST` 可為 `0.0.0.0`、`host:port` 或完整 URL；本機連線不經系統 proxy |
+
+`nodes.json` 每個節點可設 `timeout`（秒）。CLI 都在 `data/workspace/` 這個空資料夾執行，AI 讀不到本專案的檔案。
 
 ## 已知限制 / 下一步
 
 - 目前只有 Web 介面；桌面殼（Electron）與安裝檔尚未做。
 - 任務只做文字生成（Claude 工具已停用）；尚無寫檔 / 跑測試 / git worktree 沙箱。
 - 任務與節點狀態僅存記憶體，重啟後不還原（僅事件 log 持久化）。
-- Gemini CLI、Ollama 尚未在實機驗證（雲端環境沒有安裝），只有 Claude CLI 做過真實呼叫。
-- Ollama：`nodes.json` 指定的模型沒安裝時，會自動改用第一個已安裝的模型；`OLLAMA_HOST` 可為 `0.0.0.0`、`host:port` 或完整 URL。
+- 開發環境（Linux）實測過：真實 Claude CLI 串流；真實 Gemini CLI 0.63 的信任資料夾修正（沒有 Google 登入，未跑到實際回覆）；Ollama 以模擬伺服器測試。Windows 實機尚未驗證。

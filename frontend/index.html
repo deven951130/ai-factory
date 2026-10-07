@@ -41,6 +41,9 @@
   .row { display:flex; gap:8px; margin-top:8px; } .row > input { flex:1; }
   #log, #chat { height:240px; overflow:auto; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; }
   .err { color:var(--fail); } .me { color:var(--run); } .ai { color:var(--text); } .src { color:var(--mute); }
+  .out.live { color:var(--text); border-left:2px solid var(--run); padding-left:8px; }
+  button.ghost { background:transparent; border-color:var(--line); font-size:12px; padding:2px 8px; }
+  .badge.cancelled{background:var(--off)}
   .out { margin-top:6px; font-size:12px; color:var(--mute); white-space:pre-wrap; max-height:140px; overflow:auto; }
 </style>
 </head>
@@ -52,7 +55,7 @@
     <section><h2>生產線</h2><div id="belt" class="belt"></div></section>
     <section><h2>任務</h2>
       <div id="asks"></div>
-      <input id="title" placeholder="任務標題" style="width:100%;margin-bottom:6px">
+      <input id="title" placeholder="任務標題（可留空）" style="width:100%;margin-bottom:6px">
       <textarea id="prompt" rows="3" placeholder="描述需求，送進生產線（分析 → 實作 → 審查）"></textarea>
       <div class="row"><button id="go">送進工廠</button></div>
       <div id="tasks" style="margin-top:12px"></div>
@@ -70,44 +73,95 @@
 <script>
 const $ = s => document.querySelector(s);
 const S = { nodes:{}, tasks:{}, pipeline:[] };
-let liveBubble = null;
+const bubbles = new Map();   // node id -> 正在串流的對話泡泡（每個節點各自一個）
+const taskLive = new Map();  // task id -> 目前階段的即時輸出
 
-function esc(t){ return t.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+const esc = t => String(t ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const STATUS = { idle:'閒置', running:'執行中', waiting:'等你回答', failed:'失敗', offline:'離線' };
+const TASK_STATUS = { queued:'排隊', running:'進行中', waiting_user:'等你回答', done:'完成', blocked:'已阻擋', cancelled:'已取消' };
+const label = id => S.nodes[id]?.label || id;
 
 function render() {
   $('#factory').innerHTML = Object.values(S.nodes).map(n =>
-    `<div class="node ${n.status}"><div class="name">${esc(n.label)}</div><div class="role">${esc(n.role)}</div>
-     <div class="st"><span class="dot"></span>${STATUS[n.status]||n.status}</div>
-     <div class="role">${esc(n.detail||'')}</div></div>`).join('');
+    `<div class="node ${esc(n.status)}"><div class="name">${esc(n.label)}</div><div class="role">${esc(n.role)}</div>
+     <div class="st"><span class="dot"></span>${esc(STATUS[n.status]||n.status)}</div>
+     <div class="role">${esc(n.detail)}</div></div>`).join('');
   const active = Object.values(S.tasks).find(t => ['running','waiting_user'].includes(t.status));
   $('#belt').innerHTML = S.pipeline.map((s,i) => {
     const cls = active ? (i < active.stage_index ? 'past' : i === active.stage_index ? 'current' : '') : '';
-    return `<span class="stage ${cls}">${esc(s.name)} · ${esc(S.nodes[s.node]?.label||s.node)}</span>`;
+    return `<span class="stage ${cls}">${esc(s.name)} · ${esc(label(s.node))}</span>`;
   }).join('<span class="arrow">→</span>');
   const tasks = Object.values(S.tasks).reverse();
-  $('#tasks').innerHTML = tasks.map(t => `<div class="task"><b>${esc(t.title)}</b>
-     <span class="badge ${t.status}">${t.status}</span> ${t.stage ? '· '+esc(t.stage) : ''}
+  $('#tasks').innerHTML = tasks.map(t => {
+    const live = ['running','waiting_user'].includes(t.status);
+    return `<div class="task"><b>${esc(t.title)}</b>
+     <span class="badge ${esc(t.status)}">${esc(TASK_STATUS[t.status]||t.status)}</span> ${t.stage ? '· '+esc(t.stage) : ''}
+     ${live ? `<button class="ghost" data-cancel="${esc(t.id)}">取消</button>` : ''}
      ${t.error ? `<div class="err">${esc(t.error)}</div>` : ''}
-     ${t.outputs.map(o => `<div class="out"><b>${esc(o.stage)}</b>\n${esc(o.text)}</div>`).join('')}</div>`).join('');
-  $('#asks').innerHTML = tasks.filter(t => t.question).map(t => `<div class="ask">
-     <b>${esc(S.nodes[t.question.node]?.label||t.question.node)} 需要你回答：</b><div>${esc(t.question.text)}</div>
-     <div class="row"><input id="a-${t.id}" placeholder="你的回答"><button data-answer="${t.id}">回覆</button></div></div>`).join('');
+     ${t.outputs.map(o => `<div class="out"><b>${esc(o.stage)} · ${esc(label(o.node))}</b>\n${esc(o.text)}</div>`).join('')}
+     ${live ? `<div class="out live" id="tl-${esc(t.id)}">${esc(taskLive.get(t.id)||'')}</div>` : ''}</div>`;
+  }).join('');
+  renderAsks(tasks.filter(t => t.question));
+  document.title = tasks.some(t => t.question) ? '❓ AI 需要你回答' : 'AI 工廠';
 }
+
+// 提問區以任務 id 為鍵增量更新：其他事件觸發重繪時，不會清掉正在輸入的回答。
+function renderAsks(pending) {
+  const box = $('#asks'), keep = new Set(pending.map(t => t.id + '|' + t.question.text));
+  for (const el of [...box.children]) if (!keep.has(el.dataset.key)) el.remove();
+  for (const t of pending) {
+    const key = t.id + '|' + t.question.text;
+    if ([...box.children].some(el => el.dataset.key === key)) continue;
+    const div = document.createElement('div');
+    div.className = 'ask'; div.dataset.key = key;
+    div.innerHTML = `<b>${esc(label(t.question.node))} 需要你回答（${esc(t.title)}）：</b><div>${esc(t.question.text)}</div>
+      <div class="row"><input placeholder="你的回答"><button>回覆</button></div>`;
+    const input = div.querySelector('input');
+    const submit = async () => { const v = input.value.trim(); if (v && await post(`/api/tasks/${t.id}/answer`, {text: v})) input.value = ''; };
+    div.querySelector('button').onclick = submit;
+    input.onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) submit(); };
+    box.appendChild(div);
+  }
+}
+
 function log(text, cls='') { const l = $('#log'); l.insertAdjacentHTML('beforeend', `<div class="${cls}">${esc(text)}</div>`); l.scrollTop = l.scrollHeight; }
-function chatLine(who, cls, text) { const c = $('#chat'); c.insertAdjacentHTML('beforeend', `<div class="${cls}"><span class="src">${esc(who)}：</span>${esc(text)}</div>`); c.scrollTop = c.scrollHeight; }
+function chatLine(who, cls, text) { const c = $('#chat'); c.insertAdjacentHTML('beforeend', `<div class="${cls}"><span class="src">${esc(who)}：</span><span></span></div>`); c.lastElementChild.lastElementChild.textContent = text; c.scrollTop = c.scrollHeight; return c.lastElementChild; }
+function bubbleFor(node) { if (!bubbles.has(node)) bubbles.set(node, chatLine(label(node), 'ai', '')); return bubbles.get(node).lastElementChild; }
+function closeBubbles(note) { for (const b of bubbles.values()) if (note) b.lastElementChild.textContent += note; bubbles.clear(); }
 
 function onEvent(ev) {
-  if (ev.type === 'snapshot') { S.nodes = Object.fromEntries(ev.nodes.map(n=>[n.id,n])); S.tasks = Object.fromEntries(ev.tasks.map(t=>[t.id,t])); S.pipeline = ev.pipeline;
-    $('#target').innerHTML = ev.nodes.map(n=>`<option value="${n.id}">${esc(n.label)}</option>`).join(''); }
-  else if (ev.type === 'node') S.nodes[ev.node.id] = ev.node;
-  else if (ev.type === 'task') S.tasks[ev.task.id] = ev.task;
-  else if (ev.type === 'log') log(ev.text, ev.level === 'error' ? 'err' : '');
-  else if (ev.type === 'ask') { log(`❓ ${ev.node} 提問：${ev.text}`, 'err'); document.title = '❓ AI 需要你回答'; try { new Notification('AI 需要你回答', {body: ev.text}); } catch {} }
-  else if (ev.type === 'chunk' && !ev.task_id) { if (!liveBubble) { $('#chat').insertAdjacentHTML('beforeend', `<div class="ai"><span class="src">${esc(ev.node)}：</span><span id="live"></span></div>`); liveBubble = $('#live'); } liveBubble.textContent += ev.text; $('#chat').scrollTop = 1e9; }
-  else if (ev.type === 'chat') { if (ev.role === 'user') chatLine('你', 'me', ev.text); else { if (liveBubble) { liveBubble.removeAttribute('id'); liveBubble = null; } else chatLine(ev.node, 'ai', ev.text); } }
-  if (ev.type === 'task' && !ev.task.question) document.title = 'AI 工廠';
-  if (ev.type === 'chunk') return;
+  switch (ev.type) {
+    case 'snapshot': {
+      closeBubbles('（連線中斷）');
+      S.nodes = Object.fromEntries(ev.nodes.map(n=>[n.id,n])); S.tasks = Object.fromEntries(ev.tasks.map(t=>[t.id,t])); S.pipeline = ev.pipeline;
+      const prev = $('#target').value;
+      $('#target').innerHTML = ev.nodes.map(n=>`<option value="${esc(n.id)}">${esc(n.label)}</option>`).join('');
+      if (ev.nodes.some(n => n.id === prev)) $('#target').value = prev;
+      break;
+    }
+    case 'node': S.nodes[ev.node.id] = ev.node; break;
+    case 'task': {
+      const old = S.tasks[ev.task.id];
+      if (!old || old.stage !== ev.task.stage) taskLive.delete(ev.task.id);
+      S.tasks[ev.task.id] = ev.task; break;
+    }
+    case 'log': log(ev.text, ev.level === 'error' ? 'err' : ''); break;
+    case 'ask': log(`❓ ${label(ev.node)} 提問：${ev.text}`, 'err'); try { new Notification('AI 需要你回答', {body: ev.text}); } catch {} break;
+    case 'attempt':  // 重試時丟掉上一次失敗的半截輸出
+      if (ev.attempt > 1) { if (ev.task_id) taskLive.delete(ev.task_id); else if (bubbles.has(ev.node)) bubbleFor(ev.node).textContent = ''; }
+      return;
+    case 'chunk':
+      if (ev.task_id) {
+        taskLive.set(ev.task_id, (taskLive.get(ev.task_id)||'') + ev.text);
+        const el = document.getElementById('tl-' + ev.task_id);
+        if (el) { el.textContent = taskLive.get(ev.task_id); el.scrollTop = el.scrollHeight; }
+      } else { bubbleFor(ev.node).textContent += ev.text; $('#chat').scrollTop = 1e9; }
+      return;
+    case 'chat':
+      if (ev.role === 'user') { chatLine('你', 'me', ev.text); break; }
+      { const b = bubbleFor(ev.node); b.textContent = ev.text; if (ev.ok === false) b.parentElement.classList.add('err'); bubbles.delete(ev.node); }
+      break;
+  }
   render();
 }
 
@@ -119,13 +173,28 @@ function connect() {
   ws.onclose = () => { $('#conn').textContent = '○ 斷線，重連中…'; setTimeout(connect, backoff); backoff = Math.min(backoff*2, 8000); };
 }
 connect();
-try { Notification.requestPermission(); } catch {}
 
-async function post(url, body) { const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}); if(!r.ok) log((await r.json()).detail || r.statusText, 'err'); }
-$('#go').onclick = () => { const p = $('#prompt').value.trim(); if (!p) return; post('/api/tasks', {title: $('#title').value.trim() || p.slice(0,20), prompt: p}); $('#prompt').value=''; };
-const send = () => { const m = $('#msg').value.trim(); if (!m) return; post('/api/chat', {node: $('#target').value, message: m}); $('#msg').value=''; };
-$('#send').onclick = send; $('#msg').onkeydown = e => { if (e.key === 'Enter') send(); };
-document.addEventListener('click', e => { const id = e.target.dataset?.answer; if (!id) return; const el = $('#a-'+id); if (el.value.trim()) post(`/api/tasks/${id}/answer`, {text: el.value.trim()}); });
+// 瀏覽器（例如 Firefox）只允許在使用者點擊時要求通知權限。
+let asked = false;
+document.addEventListener('click', () => { if (asked) return; asked = true; try { if (Notification.permission === 'default') Notification.requestPermission(); } catch {} });
+
+async function post(url, body) {
+  try {
+    const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: body ? JSON.stringify(body) : undefined});
+    if (r.ok) return true;
+    const d = await r.json().catch(() => ({}));
+    const msg = typeof d.detail === 'string' ? d.detail : (d.detail ? JSON.stringify(d.detail) : `${r.status} ${r.statusText}`);
+    log(msg, 'err');
+  } catch (e) { log(`無法連到伺服器：${e.message}`, 'err'); }
+  return false;
+}
+$('#go').onclick = async () => {
+  const p = $('#prompt').value.trim(); if (!p) return;
+  if (await post('/api/tasks', {title: $('#title').value.trim(), prompt: p})) { $('#prompt').value = ''; $('#title').value = ''; }
+};
+const send = async () => { const m = $('#msg').value.trim(); if (m && await post('/api/chat', {node: $('#target').value, message: m})) $('#msg').value = ''; };
+$('#send').onclick = send; $('#msg').onkeydown = e => { if (e.key === 'Enter' && !e.isComposing) send(); };
+document.addEventListener('click', e => { const id = e.target.dataset?.cancel; if (id) post(`/api/tasks/${id}/cancel`); });
 </script>
 </body>
 </html>

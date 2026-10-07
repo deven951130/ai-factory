@@ -1,4 +1,6 @@
 fastapi>=0.110
-uvicorn[standard]>=0.29
+# 不用 uvicorn[standard]：其中的 httptools 沒有 Windows ARM64 / 32-bit wheel，pip 會失敗。
+uvicorn>=0.29
+websockets>=13
 httpx>=0.27
 pytest>=8

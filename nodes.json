@@ -1,9 +1,9 @@
 {
   "nodes": [
-    {"id": "gemini", "label": "Gemini", "kind": "gemini", "role": "分析 / 長文研究"},
-    {"id": "claude-opus", "label": "Claude Opus", "kind": "claude", "model": "opus", "role": "架構 / 審查"},
-    {"id": "claude-sonnet", "label": "Claude Sonnet", "kind": "claude", "model": "sonnet", "role": "實作"},
-    {"id": "ollama", "label": "本地 Qwen", "kind": "ollama", "model": "qwen2.5-coder:7b", "role": "格式轉換 / 草稿"}
+    {"id": "gemini", "label": "Gemini", "kind": "gemini", "role": "分析 / 長文研究", "timeout": 600},
+    {"id": "claude-opus", "label": "Claude Opus", "kind": "claude", "model": "opus", "role": "架構 / 審查", "timeout": 900},
+    {"id": "claude-sonnet", "label": "Claude Sonnet", "kind": "claude", "model": "sonnet", "role": "實作", "timeout": 600},
+    {"id": "ollama", "label": "本地 Qwen", "kind": "ollama", "model": "qwen2.5-coder:7b", "role": "格式轉換 / 草稿", "timeout": 300}
   ],
   "pipeline": [
     {"name": "分析", "node": "gemini", "template": "你是分析師。請把下列需求拆成明確的步驟與驗收條件：\n\n{input}"},
