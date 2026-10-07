@@ -3,12 +3,20 @@
 串接商業 AI（Claude / Gemini 訂閱 CLI）與本地 AI（Ollama），以即時 Dashboard 呈現各節點狀態，
 並可隨時對任一 AI 發問；AI 缺資訊時會暫停任務並在 Dashboard 向你提問。
 
-> 非規範性工具文件。不操作網頁 DOM、不需 API 金鑰：Claude 走 `claude -p`、Gemini 走 `gemini -p`、Ollama 走 HTTP。
+> 從 [`ai-game-studio`](https://github.com/deven951130/ai-game-studio) 的 `apps/factory/` 拆出。不操作網頁 DOM、不需 API 金鑰：Claude 走 `claude -p`、Gemini 走 `gemini -p`、Ollama 走 HTTP。
 
 ## 啟動
 
+Windows（PowerShell）一鍵啟動：建立 `.venv`、安裝套件、開瀏覽器。
+
+```powershell
+.\start.ps1            # 真實模式
+.\start.ps1 -Fake      # 模擬節點示範
+```
+
+手動：
+
 ```bash
-cd apps/factory
 pip install -r requirements.txt
 python -m uvicorn backend.main:app --port 8000     # 開 http://localhost:8000
 FACTORY_FAKE=1 python -m uvicorn backend.main:app   # 全部節點改為模擬，免登入示範
