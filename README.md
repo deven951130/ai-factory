@@ -45,6 +45,11 @@ python -m pytest -q                                  # 測試
 | Gemini | `gemini` CLI 已登入（`gemini` 跑一次完成 Google 登入） | 自動設定 `GEMINI_CLI_TRUST_WORKSPACE`，不需要手動信任資料夾 |
 | Ollama | Ollama 已啟動且至少 pull 一個對話模型 | `nodes.json` 指定的模型沒裝時，自動改用已安裝的對話模型（略過 embedding 模型）。`OLLAMA_HOST` 可為 `0.0.0.0`、`host:port` 或完整 URL；本機連線不經系統 proxy |
 
+## 安全
+
+- 只接受本機存取：`Host` 必須是 `localhost` / `127.0.0.1` / `::1`，瀏覽器帶的 `Origin` 也必須是本機。其他網站的頁面無法讀取 Dashboard 的 prompt、輸出，也無法取消任務。
+- 要從區網其他電腦開啟：以 `--host 0.0.0.0` 啟動，並設定 `FACTORY_ALLOWED_HOSTS`（逗號分隔，例如 `192.168.1.10,DESKTOP-7H2K9QX`）。區網內任何人都能看到所有內容，請只在信任的網路使用。
+
 `nodes.json` 每個節點可設 `timeout`（秒）。CLI 都在 `data/workspace/` 這個空資料夾執行，AI 讀不到本專案的檔案。
 
 ## 已知限制 / 下一步

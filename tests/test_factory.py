@@ -300,6 +300,16 @@ def test_api_chat_and_state(tmp_path):
         assert c.post("/api/tasks/zzz/cancel").status_code == 409
 
 
+def test_allowed_hosts_env_is_normalized(tmp_path, monkeypatch):
+    monkeypatch.setenv("FACTORY_ALLOWED_HOSTS", "DESKTOP-7H2K9QX, 192.168.1.10:8000, fe80::1, [fe80::2]")
+    app = create_app(force_fake=True, data_dir=tmp_path)
+    with TestClient(app, base_url=LOCAL) as c:
+        for host in ("desktop-7h2k9qx:8000", "DESKTOP-7H2K9QX:8000", "192.168.1.10:8000",
+                     "[fe80::1]:8000", "[fe80::2]:8000", "localhost:8000"):
+            assert c.get("/api/state", headers={"Host": host}).status_code == 200, host
+        assert c.get("/api/state", headers={"Host": "192.168.1.11:8000"}).status_code == 403
+
+
 def test_lone_surrogate_title_does_not_break_dashboard(tmp_path):
     app = create_app(force_fake=True, data_dir=tmp_path)
     body = '{"title": "abc\\ud83d", "prompt": "\\ud83c x"}'  # 前端把 emoji 切一半的樣子

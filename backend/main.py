@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,6 +29,19 @@ def _hostname(value: str) -> str | None:
         return None
 
 
+def normalize_host(entry: str) -> str | None:
+    """把設定的主機名稱正規化成和請求比對時相同的形式：小寫、去掉 port / scheme / 結尾的點。"""
+    h = entry.strip().lower()
+    if not h:
+        return None
+    try:
+        return str(ipaddress.ip_address(h.strip("[]")))  # 純 IPv6（例如 fe80::1）不能交給 urlsplit
+    except ValueError:
+        pass
+    name = _hostname(h)
+    return name.rstrip(".") or None if name else None
+
+
 class LocalOnly:
     """只接受本機來源的請求。
 
@@ -37,7 +51,7 @@ class LocalOnly:
     """
 
     def __init__(self, app, allowed: set[str]):
-        self.app, self.allowed = app, allowed
+        self.app, self.allowed = app, {h.lower() for h in allowed}
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
@@ -88,7 +102,7 @@ def create_app(
         force_fake = os.environ.get("FACTORY_FAKE") == "1"
     if allowed_hosts is None:  # 例如要從區網其他電腦開：FACTORY_ALLOWED_HOSTS=192.168.1.10
         extra = os.environ.get("FACTORY_ALLOWED_HOSTS", "")
-        allowed_hosts = set(DEFAULT_HOSTS) | {h.strip() for h in extra.split(",") if h.strip()}
+        allowed_hosts = set(DEFAULT_HOSTS) | {n for n in map(normalize_host, extra.split(",")) if n}
     factory = Factory(ROOT / "nodes.json", data_dir or ROOT / "data", force_fake)
 
     async def refresher() -> None:
